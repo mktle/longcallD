@@ -38,9 +38,13 @@ ABPOA_INC_DIR = $(ABPOA_DIR)/include
 WFA2_DIR    = ./WFA2-lib
 WFA2_LIB    = $(WFA2_DIR)/lib/libwfa.a
 
+DEKNOT_DIR ?= ./DeKnot
+DEKNOT_LIB  = $(DEKNOT_DIR)/libdeknot.a
+DEKNOT_INC_DIR = $(DEKNOT_DIR)/include
+
 LIB_PATH    =
-LIB         = $(HTSLIB) $(ABPOA_LIB) $(WFA2_LIB) $(LIB_PATH) -lm -lz -lpthread -llzma -lbz2 -lcurl
-INCLUDE     = -I $(HTSLIB_DIR) -I $(EDLIB_INC_DIR) -I $(ABPOA_INC_DIR) -I $(WFA2_DIR)
+LIB         = $(HTSLIB) $(ABPOA_LIB) $(WFA2_LIB) $(DEKNOT_LIB) $(LIB_PATH) -lm -lz -lpthread -llzma -lbz2 -lcurl
+INCLUDE     = -I $(HTSLIB_DIR) -I $(EDLIB_INC_DIR) -I $(ABPOA_INC_DIR) -I $(WFA2_DIR) -I $(DEKNOT_INC_DIR)
 
 # Try linking against libdeflate
 ifeq ($(shell echo "int main() {return 0;}" | ${CC} -x c - $(LIB_PATH) -ldeflate >/dev/null 2>&1 && echo "yes"),yes)
@@ -52,10 +56,10 @@ ifeq ($(UNAME_S),Linux) # Linux
 	ifneq ($(portable),)
 		LIB += -static-libgcc -static-libstdc++
 		ifneq ($(opt_lib),)
-			LIB = $(HTSLIB) $(ABPOA_LIB) $(WFA2_LIB) -static-libgcc -static-libstdc++ -L${opt_lib} -lm -lz -lpthread -llzma -lbz2 -lcurl -lssl -lcrypto -lssh2 -ldl -Wl,-Bstatic -ldeflate -Wl,-Bdynamic -lzstd
+			LIB = $(HTSLIB) $(ABPOA_LIB) $(WFA2_LIB) $(DEKNOT_LIB) -static-libgcc -static-libstdc++ -L${opt_lib} -lm -lz -lpthread -llzma -lbz2 -lcurl -lssl -lcrypto -lssh2 -ldl -Wl,-Bstatic -ldeflate -Wl,-Bdynamic -lzstd
 		else
 			ifneq ($(OPT_LIB),)
-				LIB = $(HTSLIB) $(ABPOA_LIB) $(WFA2_LIB) -static-libgcc -static-libstdc++ -L${OPT_LIB} -lm -lz -lpthread -llzma -lbz2 -lcurl -lssl -lcrypto -lssh2 -ldl -Wl,-Bstatic -ldeflate -Wl,-Bdynamic -lzstd
+				LIB = $(HTSLIB) $(ABPOA_LIB) $(WFA2_LIB) $(DEKNOT_LIB) -static-libgcc -static-libstdc++ -L${OPT_LIB} -lm -lz -lpthread -llzma -lbz2 -lcurl -lssl -lcrypto -lssh2 -ldl -Wl,-Bstatic -ldeflate -Wl,-Bdynamic -lzstd
 			endif
 		endif
 	endif
@@ -155,7 +159,10 @@ $(WFA2_LIB):
 $(WFA2_ALL): $(WFA2_LIB)
 
 
-$(BIN): $(OBJS) $(ABPOA_LIB) $(HTSLIB) $(WFA2_LIB)
+$(DEKNOT_LIB):
+	cd $(DEKNOT_DIR); make lib
+
+$(BIN): $(OBJS) $(ABPOA_LIB) $(HTSLIB) $(WFA2_LIB) $(DEKNOT_LIB)
 	if [ ! -d $(BIN_DIR) ]; then mkdir $(BIN_DIR); fi
 	$(CXX) $(BIN_LDFLAGS) $(OBJS) -o $@ $(LIB) $(PG_FLAG)
 # 	$(CC) $(OBJS) -o $@ $(LIB) $(PG_FLAG)

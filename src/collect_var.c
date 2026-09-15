@@ -2650,6 +2650,7 @@ int collect_noisy_vars1(bam_chunk_t *chunk, const call_var_opt_t *opt, int noisy
     hts_pos_t noisy_reg_beg = cr_start(noisy_regs, noisy_reg_i), noisy_reg_end = cr_end(noisy_regs, noisy_reg_i);
     uint8_t *ref_seq = NULL; int ref_seq_len = collect_reg_ref_bseq(chunk, &noisy_reg_beg, &noisy_reg_end, &ref_seq);
     int max_noisy_reg_len = opt->max_noisy_reg_len, max_noisy_reg_cov = opt->max_noisy_reg_cov;
+    if (opt->use_deknot) max_noisy_reg_len = LONGCALLD_DEKNOT_MAX_NOISY_REG_LEN;
     if (noisy_reg_end - noisy_reg_beg + 1 > max_noisy_reg_len) {
         if (LONGCALLD_VERBOSE >= 1) fprintf(stderr, "Skipped long region: %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " (>%d)\n", chunk->tname, noisy_reg_beg, noisy_reg_end, noisy_reg_end-noisy_reg_beg+1, max_noisy_reg_len);
         free(ref_seq);

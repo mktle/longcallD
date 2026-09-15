@@ -8,6 +8,7 @@
 #include "abpoa.h"
 #include "edlib.h"
 #include "call_var_main.h"
+#include "deknot.h"
 #include "bam_utils.h"
 #include "utils.h"
 #include "math_utils.h"
@@ -1757,6 +1758,45 @@ void update_digars_from_aln_str(bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts
 
 // return n_cons
 // 1. consensu calling; 2. WFA-based MSA
+static int deknot_collect_noisy_aln_str(const call_var_opt_t *opt, int n_reads, int *lens, uint8_t **seqs, char **names,
+                                        uint8_t *ref_seq, int ref_seq_len,
+                                        int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs) {
+    if (n_reads <= 0) return 0;
+    char **read_strs = (char**)malloc(n_reads * sizeof(char*));
+    for (int i = 0; i < n_reads; ++i) {
+        read_strs[i] = (char*)malloc(lens[i] + 1);
+        for (int j = 0; j < lens[i]; ++j) read_strs[i][j] = "ACGTN"[seqs[i][j]];
+        read_strs[i][lens[i]] = '\0';
+    }
+    dk_opt_t dk_opt; dk_opt_init(&dk_opt);
+    dk_opt.check_strand = (opt->is_ont != 0);
+    dk_walks_t *walks = dk_assemble_walks(&dk_opt, read_strs, names, n_reads);
+    int n_cons = 0;
+    if (walks != NULL && walks->n_walks >= 1 && walks->n_walks <= 2) {
+        n_cons = walks->n_walks;
+        for (int i = 0; i < n_cons; ++i) {
+            int wlen = strlen(walks->walks[i]);
+            if (wlen == 0) { n_cons = 0; break; }
+            uint8_t *wseq = (uint8_t*)malloc(wlen);
+            for (int j = 0; j < wlen; ++j) wseq[j] = nst_nt4_table[(int)walks->walks[i][j]];
+            wfa_collect_aln_str(opt, ref_seq, ref_seq_len, wseq, wlen, LONGCALLD_NOISY_BOTH_COVER,
+                                LONGCALLD_WFA_NO_HEURISTIC, LONGCALLD_WFA_AFFINE_2P,
+                                LONGCALLD_REF_CONS_ALN_STR(aln_strs[i]));
+            free(wseq);
+            clu_read_ids[i] = (int*)malloc(n_reads * sizeof(int));
+            clu_n_seqs[i] = 0;
+            for (int r = 0; r < n_reads; ++r) {
+                if (n_cons == 1 || walks->read_assignments[r] == i + 1)
+                    clu_read_ids[i][clu_n_seqs[i]++] = r;
+            }
+        }
+    }
+    if (walks != NULL) dk_walks_free(walks);
+    for (int i = 0; i < n_reads; ++i) free(read_strs[i]);
+    free(read_strs);
+    return n_cons;
+}
+
 int collect_noisy_reg_aln_strs(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end, int noisy_reg_i,
                                int n_noisy_reg_reads, int *noisy_read_ids, uint8_t *ref_seq, int ref_seq_len,
                                int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs) {
@@ -1798,6 +1838,11 @@ int collect_noisy_reg_aln_strs(const call_var_opt_t *opt, bam_chunk_t *chunk, ht
         if (LONGCALLD_VERBOSE >= 1) fprintf(stderr, "NoHap %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " %d reads (%d full) n_cons: %d\n", chunk->tname, noisy_reg_beg, noisy_reg_end, noisy_reg_end-noisy_reg_beg+1, n_noisy_reg_reads, n_full_reads, n_cons);
     } else {
         if (LONGCALLD_VERBOSE >= 1) fprintf(stderr, "Skipped %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " %d reads (%d full)\n", chunk->tname, noisy_reg_beg, noisy_reg_end, noisy_reg_end-noisy_reg_beg+1, n_noisy_reg_reads, n_full_reads);
+    }
+    if (n_cons == 0 && opt->use_deknot) {
+        n_cons = deknot_collect_noisy_aln_str(opt, n_noisy_reg_reads, lens, seqs, names,
+                                              ref_seq, ref_seq_len, clu_n_seqs, clu_read_ids, aln_strs);
+        if (LONGCALLD_VERBOSE >= 1) fprintf(stderr, "DeKnot %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " %d reads n_cons: %d\n", chunk->tname, noisy_reg_beg, noisy_reg_end, noisy_reg_end-noisy_reg_beg+1, n_noisy_reg_reads, n_cons);
     }
     // update digar based on ref vs read in MSA
     if (n_cons > 0 && ((opt->refine_bam && opt->out_aln_fp != NULL) || opt->out_somatic)) {

@@ -78,6 +78,7 @@ const struct option call_var_opt [] = {
     { "win-size", 1, NULL, 'w'},
     { "noisy-rat", 1, NULL, 'j' },
     { "noisy-flank", 1, NULL, 'f' },
+    { "deknot", 0, NULL, 0},
     { "merge-dis", 1, NULL, 'D'},
     { "end-clip", 1, NULL, 'c' },
     { "clip-flank", 1, NULL, 'F' },
@@ -185,6 +186,7 @@ call_var_opt_t *call_var_init_para(void) {
 
     opt->max_var_ratio_per_read = LONGCALLD_MAX_VAR_RATIO_PER_READ;
     opt->max_noisy_reg_len  = LONGCALLD_MAX_NOISY_REG_LEN;
+    opt->use_deknot = 0;
     // opt->disable_read_sampling = 0; // by default read-sampling is enabled for long noisy regions (10kb+)
     // opt->min_noisy_reg_reads = LONGCALLD_NOISY_REG_READS;
     // opt->min_noisy_reg_ratio = LONGCALLD_NOISY_REG_RATIO;
@@ -932,6 +934,7 @@ int call_var_main(int argc, char *argv[]) {
             case 'l': opt->min_sv_len = atoi(optarg); break;
             case 'T': opt->te_seq_fn = strdup(optarg); make_te_kmer_idx(opt); break;
             case 0: if (strcmp(call_var_opt[op_idx].name, "amb-base") == 0) opt->out_amb_base = 1; 
+                    else if (strcmp(call_var_opt[op_idx].name, "deknot") == 0) opt->use_deknot = 1;
                     // else if (strcmp(call_var_opt[op_idx].name, "hifi") == 0) set_hifi_opt(opt);
                     // else if (strcmp(call_var_opt[op_idx].name, "ont") == 0) set_ont_opt(opt);
                     else if (strcmp(call_var_opt[op_idx].name, "region-file") == 0 || 

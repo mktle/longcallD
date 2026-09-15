@@ -40,6 +40,7 @@
 #define LONGCALLD_NOISY_REG_FLANK_LEN 10 // during re-alignment, include 10-bp flanking region for both ends of noisy region
 
 #define LONGCALLD_MAX_NOISY_REG_LEN 50000 // >50kb noisy region will be skipped
+#define LONGCALLD_DEKNOT_MAX_NOISY_REG_LEN 250000 // with --deknot, noisy regions up to 250kb are locally assembled
 #define LONGCALLD_NOISY_REG_READS 2 // >= 5 reads supporting noisy region
 // #define LONGCALLD_NOISY_REG_RATIO 0.20 // >= 25% reads supporting noisy region
 
@@ -151,6 +152,7 @@ typedef struct call_var_opt_t {
     int noisy_reg_merge_dis, noisy_reg_flank_len; // noisy_reg_merge_win; // for re-alignment
     // filters for noisy region, i.e., coverage/ratio
     int max_noisy_reg_len, max_noisy_reg_cov; //, min_noisy_reg_reads; 
+    int use_deknot; // local assembly fallback (DeKnot) for noisy regions the consensus paths cannot handle
     double max_var_ratio_per_read, max_noisy_frac_per_read; //, min_noisy_reg_ratio;
     int min_hap_full_reads, min_hap_reads; //, min_no_hap_full_reads;
     // alignment
