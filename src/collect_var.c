@@ -2685,9 +2685,13 @@ int collect_noisy_vars1(bam_chunk_t *chunk, const call_var_opt_t *opt, int noisy
     hts_pos_t var_reg_beg = noisy_reg_beg;
     if (opt->use_deknot && n_cons <= 1 && !opt->out_somatic && !(opt->refine_bam && opt->out_aln_fp != NULL)) {
         int rescue_n_cons = deknot_sv_rescue(opt, chunk, noisy_reg_beg, noisy_reg_end, n_noisy_reads, noisy_reads, n_cons, clu_n_seqs, clu_read_ids, aln_strs, &var_reg_beg);
-        if (LONGCALLD_VERBOSE >= 1 && rescue_n_cons != n_cons)
-            fprintf(stderr, "DeKnot %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " %d reads n_cons: %d -> %d clu: %d,%d\n", chunk->tname, noisy_reg_beg, noisy_reg_end, noisy_reg_end-noisy_reg_beg+1, n_noisy_reads, n_cons, rescue_n_cons, clu_n_seqs[0], clu_n_seqs[1]);
-        n_cons = rescue_n_cons;
+        if (rescue_n_cons >= 0) {
+            if (LONGCALLD_VERBOSE >= 1)
+                fprintf(stderr, "DeKnot %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " %d reads n_cons: %d -> %d clu: %d,%d\n", chunk->tname, noisy_reg_beg, noisy_reg_end, noisy_reg_end-noisy_reg_beg+1, n_noisy_reads, n_cons, rescue_n_cons, clu_n_seqs[0], clu_n_seqs[1]);
+            n_cons = rescue_n_cons;
+        } else if (LONGCALLD_VERBOSE >= 1 && n_cons == 0) {
+            fprintf(stderr, "DeKnotFail %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " %d reads\n", chunk->tname, noisy_reg_beg, noisy_reg_end, noisy_reg_end-noisy_reg_beg+1, n_noisy_reads);
+        }
     }
 
     int n_noisy_vars = 0;

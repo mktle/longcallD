@@ -1872,7 +1872,7 @@ int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t no
         if (walks != NULL) dk_walks_free(walks);
         for (int i = 0; i < n_reads; ++i) { free(read_strs[i]); free(read_names[i]); }
         free(read_strs); free(read_names); free(read_ids); free(ref_seq);
-        return n_cons_existing;
+        return -1;
     }
 
     aln_str_t walk_alns[2];
@@ -1914,8 +1914,10 @@ int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t no
             if (!extended) break;
         }
         uint8_t *cons_seqs[2] = {NULL, NULL}; int cons_lens[2] = {0, 0};
+        int trim_ok = 1;
         for (int i = 0; i < rescue_n; ++i) {
             deknot_trim_aln(walk_alns + i, exp_beg, win_beg, win_end);
+            if (walk_alns[i].aln_len <= 0) trim_ok = 0;
             aln_str_t *dst = LONGCALLD_REF_CONS_ALN_STR(aln_strs[i]);
             if (dst->target_aln != NULL) free(dst->target_aln);
             *dst = walk_alns[i];
@@ -1928,9 +1930,12 @@ int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t no
                 if (walk_alns[i].query_aln[c] != 5) cons_seqs[i][cons_lens[i]++] = walk_alns[i].query_aln[c];
             }
         }
+        for (int i = 0; i < rescue_n; ++i) {
+            if (cons_lens[i] <= 0) trim_ok = 0;
+        }
         // assign each noisy-region read to the walk it matches best, and record its read-vs-cons alignment
         // (clusters are restricted to the noisy-region read set: the aln_str slots are sized for it)
-        for (int k = 0; k < n_noisy_reads; ++k) {
+        for (int k = 0; trim_ok && k < n_noisy_reads; ++k) {
             int rlen = 0, rcover = 0, rb = 0, re = 0; uint8_t *rseq = NULL;
             collect_noisy_read_info1(opt, chunk, noisy_reads[k], win_beg, win_end, &rlen, &rseq, &rcover, &rb, &re);
             // reads fully interior to the window carry no boundary anchor
@@ -1969,12 +1974,28 @@ int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t no
             clu_read_ids[best_i][clu_n_seqs[best_i]++] = noisy_reads[k];
         }
         for (int i = 0; i < rescue_n; ++i) free(cons_seqs[i]);
+        // a committed walk with no read support is not a haplotype: demote to a single consensus
+        if (rescue_n == 2 && (clu_n_seqs[0] == 0 || clu_n_seqs[1] == 0)) {
+            if (clu_n_seqs[0] == 0) {
+                aln_str_t *tmp_a = aln_strs[0]; aln_strs[0] = aln_strs[1]; aln_strs[1] = tmp_a;
+                int *tmp_r = clu_read_ids[0]; clu_read_ids[0] = clu_read_ids[1]; clu_read_ids[1] = tmp_r;
+                clu_n_seqs[0] = clu_n_seqs[1];
+            }
+            aln_str_t *drop = LONGCALLD_REF_CONS_ALN_STR(aln_strs[1]);
+            if (drop->target_aln != NULL) { free(drop->target_aln); drop->target_aln = NULL; drop->query_aln = NULL; drop->aln_len = 0; }
+            if (clu_read_ids[1] != NULL) { free(clu_read_ids[1]); clu_read_ids[1] = NULL; }
+            clu_n_seqs[1] = 0;
+            rescue_n = 1;
+        }
+        if (rescue_n == 1 && clu_n_seqs[0] == 0) rescue_n = 0;
+        if (!trim_ok) rescue_n = 0;
+        if (rescue_n <= n_cons_existing) rescue_n = -1;
         *var_reg_beg = win_beg;
     } else {
         for (int i = 0; i < rescue_n; ++i) {
             if (walk_alns[i].target_aln != NULL) free(walk_alns[i].target_aln);
         }
-        rescue_n = n_cons_existing;
+        rescue_n = -1;
     }
     dk_walks_free(walks);
     for (int i = 0; i < n_reads; ++i) { free(read_strs[i]); free(read_names[i]); }
