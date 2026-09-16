@@ -159,8 +159,10 @@ $(WFA2_LIB):
 $(WFA2_ALL): $(WFA2_LIB)
 
 
-$(DEKNOT_LIB):
+.PHONY: deknot_lib
+deknot_lib:
 	cd $(DEKNOT_DIR); make lib
+$(DEKNOT_LIB): deknot_lib ;
 
 $(BIN): $(OBJS) $(ABPOA_LIB) $(HTSLIB) $(WFA2_LIB) $(DEKNOT_LIB)
 	if [ ! -d $(BIN_DIR) ]; then mkdir $(BIN_DIR); fi

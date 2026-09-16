@@ -1933,15 +1933,19 @@ int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t no
         for (int k = 0; k < n_noisy_reads; ++k) {
             int rlen = 0, rcover = 0, rb = 0, re = 0; uint8_t *rseq = NULL;
             collect_noisy_read_info1(opt, chunk, noisy_reads[k], win_beg, win_end, &rlen, &rseq, &rcover, &rb, &re);
-            if (rlen <= 0) { free(rseq); continue; }
+            // reads fully interior to the window carry no boundary anchor
+            if (rlen <= 0 || LONGCALLD_NOISY_IS_NOT_COVER(rcover)) { free(rseq); continue; }
             aln_str_t cand[2];
             int scores[2] = {INT32_MIN, INT32_MIN};
             for (int i = 0; i < rescue_n; ++i) {
                 cand[i].target_aln = NULL; cand[i].query_aln = NULL; cand[i].aln_len = 0;
+                cand[i].target_beg = 0; cand[i].target_end = -1; cand[i].query_beg = 0; cand[i].query_end = -1;
                 wfa_collect_aln_str(opt, cons_seqs[i], cons_lens[i], rseq, rlen, rcover,
                                     LONGCALLD_WFA_NO_HEURISTIC, LONGCALLD_WFA_AFFINE_2P, cand + i);
+                if (cand[i].target_aln == NULL || cand[i].aln_len <= 0) continue;
                 int eq = 0, xid = 0;
                 for (int c = cand[i].target_beg; c <= cand[i].target_end && c < cand[i].aln_len; ++c) {
+                    if (c < 0) continue;
                     if (cand[i].target_aln[c] == cand[i].query_aln[c] && cand[i].target_aln[c] != 5) eq++;
                     else xid++;
                 }
@@ -1951,6 +1955,11 @@ int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t no
             if (rescue_n == 2) {
                 int other = 1 - best_i;
                 if (cand[other].target_aln != NULL) free(cand[other].target_aln);
+            }
+            if (scores[best_i] == INT32_MIN || cand[best_i].target_aln == NULL) {
+                if (cand[best_i].target_aln != NULL) free(cand[best_i].target_aln);
+                free(rseq);
+                continue;
             }
             int j = clu_n_seqs[best_i];
             aln_str_t *cr = LONGCALLD_CONS_READ_ALN_STR(aln_strs[best_i], j);
