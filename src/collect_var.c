@@ -2682,6 +2682,13 @@ int collect_noisy_vars1(bam_chunk_t *chunk, const call_var_opt_t *opt, int noisy
                                         clu_n_seqs, clu_read_ids, aln_strs);
     if (LONGCALLD_VERBOSE >= 2) fprintf(stderr, "n_cons: %d\n", n_cons);
     free(ref_seq);
+    hts_pos_t var_reg_beg = noisy_reg_beg;
+    if (opt->use_deknot && n_cons <= 1 && !opt->out_somatic && !(opt->refine_bam && opt->out_aln_fp != NULL)) {
+        int rescue_n_cons = deknot_sv_rescue(opt, chunk, noisy_reg_beg, noisy_reg_end, n_noisy_reads, noisy_reads, n_cons, clu_n_seqs, clu_read_ids, aln_strs, &var_reg_beg);
+        if (LONGCALLD_VERBOSE >= 1 && rescue_n_cons != n_cons)
+            fprintf(stderr, "DeKnot %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " %d reads n_cons: %d -> %d clu: %d,%d\n", chunk->tname, noisy_reg_beg, noisy_reg_end, noisy_reg_end-noisy_reg_beg+1, n_noisy_reads, n_cons, rescue_n_cons, clu_n_seqs[0], clu_n_seqs[1]);
+        n_cons = rescue_n_cons;
+    }
 
     int n_noisy_vars = 0;
     if (n_cons == 0) {
@@ -2696,7 +2703,7 @@ int collect_noisy_vars1(bam_chunk_t *chunk, const call_var_opt_t *opt, int noisy
     //    if out_somatic==1: collect candidate somatic variants + read_var_profile for all reads
     // 2. collect RetroTrans info for cons: germline
     //    if out_somatic==1: collect RetroTans info for somatic variant reads
-    n_noisy_vars = make_vars_from_msa_cons_aln(opt, chunk, n_noisy_reads, noisy_reads, noisy_reg_beg,
+    n_noisy_vars = make_vars_from_msa_cons_aln(opt, chunk, n_noisy_reads, noisy_reads, var_reg_beg,
                                                n_cons, clu_n_seqs, clu_read_ids, aln_strs, &noisy_vars, &noisy_var_cate, &noisy_rvp);
     if (opt->out_somatic) {
         int n_noisy_somatic_var=0; cand_var_t *noisy_somatic_vars=NULL; int *noisy_somatic_var_cate=NULL; read_var_profile_t *noisy_somatic_rvp = NULL;

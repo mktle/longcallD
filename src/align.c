@@ -372,13 +372,13 @@ int wfa_heuristic_aln(uint8_t *pattern, int plen, uint8_t *text, int tlen,
 // cons vs ref: ultra-low mem + dual-gap + no heuristic to ensure accurate alignment
 // full read/cons vs full read: ultra-low mem + affine-gap + wf-adaptive to ensure accurate alignment and speed up
 // full read/cons vs partial read: high mem (default) + affine-gap + heuristic (xdrop/zdrop) to speed up
-int wfa_end2end_aln(uint8_t *pattern, int plen, uint8_t *text, int tlen,
+int wfa_end2end_aln_mem(int mem_ultralow, int pattern_ends_free, uint8_t *pattern, int plen, uint8_t *text, int tlen,
                     int gap_aln, int b, int q, int e, int q2, int e2, int heuristic, int affine_gap, // heuristic: 0: no, 1: default, 2: zdrop
                     uint32_t **cigar_buf, int *cigar_length, uint8_t **pattern_alg, uint8_t **text_alg, int *alg_length) {
     // double realtime0 = realtime();
     // fprintf(stderr, "WFA-end2end %d vs %d\n", plen, tlen);
     wavefront_aligner_attr_t attributes = wavefront_aligner_attr_default;
-    // if (heuristic != LONGCALLD_WFA_ZDROP) attributes.memory_mode = wavefront_memory_ultralow;
+    if (mem_ultralow) attributes.memory_mode = wavefront_memory_ultralow;
     if (affine_gap == LONGCALLD_WFA_AFFINE_2P) {
         attributes.distance_metric = gap_affine_2p;
         attributes.affine2p_penalties.match = 0; // -a;
@@ -395,7 +395,13 @@ int wfa_end2end_aln(uint8_t *pattern, int plen, uint8_t *text, int tlen,
         attributes.affine_penalties.gap_extension = e;
     }
     attributes.alignment_scope = compute_alignment;
-    attributes.alignment_form.span = alignment_end2end;
+    if (pattern_ends_free > 0) {
+        attributes.alignment_form.span = alignment_endsfree;
+        attributes.alignment_form.pattern_begin_free = pattern_ends_free;
+        attributes.alignment_form.pattern_end_free = pattern_ends_free;
+        attributes.alignment_form.text_begin_free = 0;
+        attributes.alignment_form.text_end_free = 0;
+    } else attributes.alignment_form.span = alignment_end2end;
     if (heuristic == LONGCALLD_WFA_NO_HEURISTIC) 
         attributes.heuristic.strategy = wf_heuristic_none;
     if (heuristic == LONGCALLD_WFA_ADAPTIVE) // default heuristic
@@ -563,6 +569,13 @@ void wfa_trim_aln_str(int full_cover, aln_str_t *aln_str) {
 }
 
 // for read with full_cover as 1 or 2, collect beg/end positions of read mapped to target
+int wfa_end2end_aln(uint8_t *pattern, int plen, uint8_t *text, int tlen,
+                    int gap_aln, int b, int q, int e, int q2, int e2, int heuristic, int affine_gap,
+                    uint32_t **cigar_buf, int *cigar_length, uint8_t **pattern_alg, uint8_t **text_alg, int *alg_length) {
+    return wfa_end2end_aln_mem(0, 0, pattern, plen, text, tlen, gap_aln, b, q, e, q2, e2, heuristic, affine_gap,
+                               cigar_buf, cigar_length, pattern_alg, text_alg, alg_length);
+}
+
 int wfa_collect_aln_str(const call_var_opt_t *opt, uint8_t *target, int tlen, uint8_t *query, int qlen, int full_cover, int heuristic, int affine_gap, aln_str_t *aln_str) {
     if (LONGCALLD_NOISY_IS_NOT_COVER(full_cover)) return 0;
     aln_str->target_aln = 0; aln_str->query_aln = 0; aln_str->aln_len = 0;
@@ -1758,43 +1771,206 @@ void update_digars_from_aln_str(bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts
 
 // return n_cons
 // 1. consensu calling; 2. WFA-based MSA
-static int deknot_collect_noisy_aln_str(const call_var_opt_t *opt, int n_reads, int *lens, uint8_t **seqs, char **names,
-                                        uint8_t *ref_seq, int ref_seq_len,
-                                        int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs) {
-    if (n_reads <= 0) return 0;
+
+extern int collect_noisy_read_info1(const call_var_opt_t *opt, bam_chunk_t *chunk, int read_id, hts_pos_t reg_beg, hts_pos_t reg_end, int *read_len,
+                                    uint8_t **read_seqs, int *fully_covers, int *read_reg_beg, int *read_reg_end);
+
+// extend [win_beg, win_end] so that neither boundary cuts through an indel run of this walk-vs-ref alignment
+static int deknot_extend_ref_window(aln_str_t *as, hts_pos_t aln_ref_beg, hts_pos_t *win_beg, hts_pos_t *win_end) {
+    int extended = 0;
+    hts_pos_t ref_pos = aln_ref_beg;
+    int col_beg = -1, col_end = -1;
+    for (int col = 0; col < as->aln_len; ++col) {
+        if (as->target_aln[col] != 5) {
+            if (ref_pos == *win_beg) col_beg = col;
+            if (ref_pos == *win_end) { col_end = col; break; }
+            ref_pos++;
+        }
+    }
+    if (col_beg == -1 || col_end == -1) return 0;
+    hts_pos_t new_beg = *win_beg, new_end = *win_end;
+    while (col_beg > 0 && as->query_aln[col_beg] == 5) { // boundary inside a deletion run
+        col_beg--;
+        if (as->target_aln[col_beg] != 5) new_beg--;
+    }
+    while (col_end < as->aln_len-1 && as->query_aln[col_end] == 5) {
+        col_end++;
+        if (as->target_aln[col_end] != 5) new_end++;
+    }
+    if (new_beg < *win_beg) { *win_beg = new_beg; extended = 1; }
+    if (new_end > *win_end) { *win_end = new_end; extended = 1; }
+    return extended;
+}
+
+// cut the alignment down to the columns covering ref window [win_beg, win_end]
+static void deknot_trim_aln(aln_str_t *as, hts_pos_t aln_ref_beg, hts_pos_t win_beg, hts_pos_t win_end) {
+    hts_pos_t ref_pos = aln_ref_beg;
+    int col_beg = -1, col_end = -1;
+    for (int col = 0; col < as->aln_len; ++col) {
+        if (as->target_aln[col] != 5) {
+            if (ref_pos == win_beg && col_beg == -1) col_beg = col;
+            if (ref_pos == win_end) { col_end = col; break; }
+            ref_pos++;
+        }
+    }
+    if (col_beg == -1) col_beg = 0;
+    if (col_end == -1) col_end = as->aln_len-1;
+    int new_len = col_end - col_beg + 1;
+    // single block, query_aln points inside it (same convention as wfa_collect_pretty_alignment,
+    // downstream cleanup frees target_aln only)
+    uint8_t *mem = (uint8_t*)malloc(2 * new_len * sizeof(uint8_t));
+    memcpy(mem, as->target_aln + col_beg, new_len);
+    memcpy(mem + new_len, as->query_aln + col_beg, new_len);
+    free(as->target_aln);
+    as->target_aln = mem; as->query_aln = mem + new_len; as->aln_len = new_len;
+    as->target_beg = 0; as->target_end = new_len-1;
+    as->query_beg = 0; as->query_end = new_len-1;
+}
+
+// local assembly rescue over an expanded window: full-length read subsequences are assembled with DeKnot,
+// the phased walks are aligned to the expanded reference, and the alignments are trimmed back to the
+// noisy region (extended over any indel run that crosses its boundary, so SVs survive intact).
+// commits results into clu_n_seqs/clu_read_ids/aln_strs only when it improves on n_cons_existing.
+int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
+                     int n_noisy_reads, int *noisy_reads,
+                     int n_cons_existing, int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs, hts_pos_t *var_reg_beg) {
+    hts_pos_t exp_beg = noisy_reg_beg - LONGCALLD_DEKNOT_FLANK_LEN;
+    hts_pos_t exp_end = noisy_reg_end + LONGCALLD_DEKNOT_FLANK_LEN;
+    if (exp_beg < 1) exp_beg = 1;
+    uint8_t *ref_seq = NULL;
+    int ref_seq_len = collect_reg_ref_bseq(chunk, &exp_beg, &exp_end, &ref_seq);
+    if (ref_seq_len <= 0 || ref_seq_len > LONGCALLD_DEKNOT_MAX_WIN) { free(ref_seq); return n_cons_existing; }
+
+    int n_reads = 0;
+    int *read_ids = (int*)malloc(chunk->n_reads * sizeof(int));
+    for (int i = 0; i < chunk->n_reads; ++i) {
+        if (chunk->is_skipped[i]) continue;
+        digar_t *d = chunk->digars + i;
+        if (d->beg <= exp_end && d->end >= exp_beg) read_ids[n_reads++] = i;
+    }
+    if (n_reads < opt->min_dp || n_reads > opt->max_noisy_reg_cov) { free(read_ids); free(ref_seq); return n_cons_existing; }
+
     char **read_strs = (char**)malloc(n_reads * sizeof(char*));
+    char **read_names = (char**)malloc(n_reads * sizeof(char*));
     for (int i = 0; i < n_reads; ++i) {
-        read_strs[i] = (char*)malloc(lens[i] + 1);
-        for (int j = 0; j < lens[i]; ++j) read_strs[i][j] = "ACGTN"[seqs[i][j]];
-        read_strs[i][lens[i]] = '\0';
+        int len = 0, cover = 0, rb = 0, re = 0; uint8_t *bseq = NULL;
+        collect_noisy_read_info1(opt, chunk, read_ids[i], exp_beg, exp_end, &len, &bseq, &cover, &rb, &re);
+        read_strs[i] = (char*)malloc(len + 1);
+        for (int j = 0; j < len; ++j) read_strs[i][j] = "ACGTN"[bseq[j]];
+        read_strs[i][len] = '\0';
+        free(bseq);
+        read_names[i] = (char*)malloc(16);
+        snprintf(read_names[i], 16, "r%d", i);
     }
     dk_opt_t dk_opt; dk_opt_init(&dk_opt);
     dk_opt.check_strand = (opt->is_ont != 0);
-    dk_walks_t *walks = dk_assemble_walks(&dk_opt, read_strs, names, n_reads);
-    int n_cons = 0;
-    if (walks != NULL && walks->n_walks >= 1 && walks->n_walks <= 2) {
-        n_cons = walks->n_walks;
-        for (int i = 0; i < n_cons; ++i) {
-            int wlen = strlen(walks->walks[i]);
-            if (wlen == 0) { n_cons = 0; break; }
-            uint8_t *wseq = (uint8_t*)malloc(wlen);
-            for (int j = 0; j < wlen; ++j) wseq[j] = nst_nt4_table[(int)walks->walks[i][j]];
-            wfa_collect_aln_str(opt, ref_seq, ref_seq_len, wseq, wlen, LONGCALLD_NOISY_BOTH_COVER,
-                                LONGCALLD_WFA_NO_HEURISTIC, LONGCALLD_WFA_AFFINE_2P,
-                                LONGCALLD_REF_CONS_ALN_STR(aln_strs[i]));
-            free(wseq);
-            clu_read_ids[i] = (int*)malloc(n_reads * sizeof(int));
+    dk_walks_t *walks = dk_assemble_walks(&dk_opt, read_strs, read_names, n_reads);
+
+    int rescue_n = 0;
+    if (walks != NULL && walks->n_walks >= 1 && walks->n_walks <= 2) rescue_n = walks->n_walks;
+    if (rescue_n <= n_cons_existing) {
+        if (walks != NULL) dk_walks_free(walks);
+        for (int i = 0; i < n_reads; ++i) { free(read_strs[i]); free(read_names[i]); }
+        free(read_strs); free(read_names); free(read_ids); free(ref_seq);
+        return n_cons_existing;
+    }
+
+    aln_str_t walk_alns[2];
+    for (int i = 0; i < 2; ++i) { walk_alns[i].target_aln = NULL; walk_alns[i].query_aln = NULL; walk_alns[i].aln_len = 0; }
+    int aln_ok = 1;
+    for (int i = 0; i < rescue_n; ++i) {
+        int wlen = strlen(walks->walks[i]);
+        if (wlen == 0) { aln_ok = 0; break; }
+        uint8_t *wseq = (uint8_t*)malloc(wlen);
+        uint8_t *wseq_rc = (uint8_t*)malloc(wlen);
+        for (int j = 0; j < wlen; ++j) wseq[j] = nst_nt4_table[(int)walks->walks[i][j]];
+        for (int j = 0; j < wlen; ++j) wseq_rc[j] = (wseq[wlen-1-j] < 4) ? 3 - wseq[wlen-1-j] : 4;
+        // DeKnot walks have arbitrary strand: pick the orientation with more matched bases,
+        // and reject walks that align poorly either way
+        int fwd_eq = 0, fwd_xid = 0, rev_eq = 0, rev_xid = 0;
+        edlib_end2end_aln(ref_seq, ref_seq_len, wseq, wlen, &fwd_eq, &fwd_xid);
+        edlib_end2end_aln(ref_seq, ref_seq_len, wseq_rc, wlen, &rev_eq, &rev_xid);
+        uint8_t *use_seq = (rev_eq > fwd_eq) ? wseq_rc : wseq;
+        int best_eq = (rev_eq > fwd_eq) ? rev_eq : fwd_eq;
+        int min_len = (wlen < ref_seq_len) ? wlen : ref_seq_len;
+        if (best_eq < (int)(0.55 * min_len)) { free(wseq); free(wseq_rc); aln_ok = 0; break; }
+        wfa_end2end_aln_mem(1, 0, ref_seq, ref_seq_len, use_seq, wlen, opt->gap_aln, opt->mismatch, opt->gap_open1, opt->gap_ext1, opt->gap_open2, opt->gap_ext2,
+                            LONGCALLD_WFA_NO_HEURISTIC, LONGCALLD_WFA_AFFINE_2P,
+                            NULL, NULL, &walk_alns[i].target_aln, &walk_alns[i].query_aln, &walk_alns[i].aln_len);
+        walk_alns[i].target_beg = 0; walk_alns[i].target_end = walk_alns[i].aln_len-1;
+        walk_alns[i].query_beg = 0; walk_alns[i].query_end = walk_alns[i].aln_len-1;
+        free(wseq); free(wseq_rc);
+        if (walk_alns[i].aln_len <= 0) { aln_ok = 0; break; }
+    }
+    if (aln_ok) {
+        hts_pos_t win_beg = noisy_reg_beg - opt->noisy_reg_flank_len, win_end = noisy_reg_end + opt->noisy_reg_flank_len;
+        if (win_beg < exp_beg) win_beg = exp_beg;
+        if (win_end > exp_end) win_end = exp_end;
+        for (int iter = 0; iter < 10; ++iter) {
+            int extended = 0;
+            for (int i = 0; i < rescue_n; ++i) extended |= deknot_extend_ref_window(walk_alns + i, exp_beg, &win_beg, &win_end);
+            if (win_beg < exp_beg) win_beg = exp_beg;
+            if (win_end > exp_end) win_end = exp_end;
+            if (!extended) break;
+        }
+        uint8_t *cons_seqs[2] = {NULL, NULL}; int cons_lens[2] = {0, 0};
+        for (int i = 0; i < rescue_n; ++i) {
+            deknot_trim_aln(walk_alns + i, exp_beg, win_beg, win_end);
+            aln_str_t *dst = LONGCALLD_REF_CONS_ALN_STR(aln_strs[i]);
+            if (dst->target_aln != NULL) free(dst->target_aln);
+            *dst = walk_alns[i];
+            if (clu_read_ids[i] != NULL) free(clu_read_ids[i]);
+            clu_read_ids[i] = (int*)malloc(n_noisy_reads * sizeof(int));
             clu_n_seqs[i] = 0;
-            for (int r = 0; r < n_reads; ++r) {
-                if (n_cons == 1 || walks->read_assignments[r] == i + 1)
-                    clu_read_ids[i][clu_n_seqs[i]++] = r;
+            // trimmed walk sequence in cons space
+            cons_seqs[i] = (uint8_t*)malloc(walk_alns[i].aln_len * sizeof(uint8_t));
+            for (int c = 0; c < walk_alns[i].aln_len; ++c) {
+                if (walk_alns[i].query_aln[c] != 5) cons_seqs[i][cons_lens[i]++] = walk_alns[i].query_aln[c];
             }
         }
+        // assign each noisy-region read to the walk it matches best, and record its read-vs-cons alignment
+        // (clusters are restricted to the noisy-region read set: the aln_str slots are sized for it)
+        for (int k = 0; k < n_noisy_reads; ++k) {
+            int rlen = 0, rcover = 0, rb = 0, re = 0; uint8_t *rseq = NULL;
+            collect_noisy_read_info1(opt, chunk, noisy_reads[k], win_beg, win_end, &rlen, &rseq, &rcover, &rb, &re);
+            if (rlen <= 0) { free(rseq); continue; }
+            aln_str_t cand[2];
+            int scores[2] = {INT32_MIN, INT32_MIN};
+            for (int i = 0; i < rescue_n; ++i) {
+                cand[i].target_aln = NULL; cand[i].query_aln = NULL; cand[i].aln_len = 0;
+                wfa_collect_aln_str(opt, cons_seqs[i], cons_lens[i], rseq, rlen, rcover,
+                                    LONGCALLD_WFA_NO_HEURISTIC, LONGCALLD_WFA_AFFINE_2P, cand + i);
+                int eq = 0, xid = 0;
+                for (int c = cand[i].target_beg; c <= cand[i].target_end && c < cand[i].aln_len; ++c) {
+                    if (cand[i].target_aln[c] == cand[i].query_aln[c] && cand[i].target_aln[c] != 5) eq++;
+                    else xid++;
+                }
+                scores[i] = eq - xid;
+            }
+            int best_i = (rescue_n == 2 && scores[1] > scores[0]) ? 1 : 0;
+            if (rescue_n == 2) {
+                int other = 1 - best_i;
+                if (cand[other].target_aln != NULL) free(cand[other].target_aln);
+            }
+            int j = clu_n_seqs[best_i];
+            aln_str_t *cr = LONGCALLD_CONS_READ_ALN_STR(aln_strs[best_i], j);
+            if (cr->target_aln != NULL) free(cr->target_aln);
+            *cr = cand[best_i];
+            free(rseq);
+            clu_read_ids[best_i][clu_n_seqs[best_i]++] = noisy_reads[k];
+        }
+        for (int i = 0; i < rescue_n; ++i) free(cons_seqs[i]);
+        *var_reg_beg = win_beg;
+    } else {
+        for (int i = 0; i < rescue_n; ++i) {
+            if (walk_alns[i].target_aln != NULL) free(walk_alns[i].target_aln);
+        }
+        rescue_n = n_cons_existing;
     }
-    if (walks != NULL) dk_walks_free(walks);
-    for (int i = 0; i < n_reads; ++i) free(read_strs[i]);
-    free(read_strs);
-    return n_cons;
+    dk_walks_free(walks);
+    for (int i = 0; i < n_reads; ++i) { free(read_strs[i]); free(read_names[i]); }
+    free(read_strs); free(read_names); free(read_ids); free(ref_seq);
+    return rescue_n;
 }
 
 int collect_noisy_reg_aln_strs(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end, int noisy_reg_i,
@@ -1838,11 +2014,6 @@ int collect_noisy_reg_aln_strs(const call_var_opt_t *opt, bam_chunk_t *chunk, ht
         if (LONGCALLD_VERBOSE >= 1) fprintf(stderr, "NoHap %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " %d reads (%d full) n_cons: %d\n", chunk->tname, noisy_reg_beg, noisy_reg_end, noisy_reg_end-noisy_reg_beg+1, n_noisy_reg_reads, n_full_reads, n_cons);
     } else {
         if (LONGCALLD_VERBOSE >= 1) fprintf(stderr, "Skipped %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " %d reads (%d full)\n", chunk->tname, noisy_reg_beg, noisy_reg_end, noisy_reg_end-noisy_reg_beg+1, n_noisy_reg_reads, n_full_reads);
-    }
-    if (n_cons == 0 && opt->use_deknot) {
-        n_cons = deknot_collect_noisy_aln_str(opt, n_noisy_reg_reads, lens, seqs, names,
-                                              ref_seq, ref_seq_len, clu_n_seqs, clu_read_ids, aln_strs);
-        if (LONGCALLD_VERBOSE >= 1) fprintf(stderr, "DeKnot %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " %d reads n_cons: %d\n", chunk->tname, noisy_reg_beg, noisy_reg_end, noisy_reg_end-noisy_reg_beg+1, n_noisy_reg_reads, n_cons);
     }
     // update digar based on ref vs read in MSA
     if (n_cons > 0 && ((opt->refine_bam && opt->out_aln_fp != NULL) || opt->out_somatic)) {

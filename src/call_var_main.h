@@ -41,6 +41,8 @@
 
 #define LONGCALLD_MAX_NOISY_REG_LEN 50000 // >50kb noisy region will be skipped
 #define LONGCALLD_DEKNOT_MAX_NOISY_REG_LEN 250000 // with --deknot, noisy regions up to 250kb are locally assembled
+#define LONGCALLD_DEKNOT_FLANK_LEN 50000 // expansion around a noisy region for local assembly
+#define LONGCALLD_DEKNOT_MAX_WIN 160000 // max expanded window size for local assembly
 #define LONGCALLD_NOISY_REG_READS 2 // >= 5 reads supporting noisy region
 // #define LONGCALLD_NOISY_REG_RATIO 0.20 // >= 25% reads supporting noisy region
 
