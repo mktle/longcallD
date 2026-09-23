@@ -1831,11 +1831,24 @@ static void deknot_trim_aln(aln_str_t *as, hts_pos_t aln_ref_beg, hts_pos_t win_
 // the phased walks are aligned to the expanded reference, and the alignments are trimmed back to the
 // noisy region (extended over any indel run that crosses its boundary, so SVs survive intact).
 // commits results into clu_n_seqs/clu_read_ids/aln_strs only when it improves on n_cons_existing.
-int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
-                     int n_noisy_reads, int *noisy_reads,
+static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
+                     int n_noisy_reads, int *noisy_reads, hts_pos_t flank_len, int abort_on_edge, int *hit_window_edge,
                      int n_cons_existing, int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs, hts_pos_t *var_reg_beg) {
-    hts_pos_t exp_beg = noisy_reg_beg - LONGCALLD_DEKNOT_FLANK_LEN;
-    hts_pos_t exp_end = noisy_reg_end + LONGCALLD_DEKNOT_FLANK_LEN;
+    // a region that already has a consensus is only worth re-assembling when it shows a
+    // breakpoint signature: multiple reads that fail to fully span it (clips/gaps at the edges)
+    if (n_cons_existing >= 1) {
+        int n_nonfull = 0;
+        for (int k = 0; k < n_noisy_reads; ++k) {
+            int rlen = 0, rcover = 0, rb = 0, re = 0; uint8_t *rseq = NULL;
+            collect_noisy_read_info1(opt, chunk, noisy_reads[k], noisy_reg_beg, noisy_reg_end, &rlen, &rseq, &rcover, &rb, &re);
+            free(rseq);
+            if (!LONGCALLD_NOISY_IS_BOTH_COVER(rcover)) n_nonfull++;
+        }
+        if (n_nonfull < 2) return -1;
+    }
+    *hit_window_edge = 0;
+    hts_pos_t exp_beg = noisy_reg_beg - flank_len;
+    hts_pos_t exp_end = noisy_reg_end + flank_len;
     if (exp_beg < 1) exp_beg = 1;
     uint8_t *ref_seq = NULL;
     int ref_seq_len = collect_reg_ref_bseq(chunk, &exp_beg, &exp_end, &ref_seq);
@@ -1848,7 +1861,31 @@ int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t no
         digar_t *d = chunk->digars + i;
         if (d->beg <= exp_end && d->end >= exp_beg) read_ids[n_reads++] = i;
     }
-    if (n_reads < opt->min_dp || n_reads > opt->max_noisy_reg_cov) { free(read_ids); free(ref_seq); return n_cons_existing; }
+    if (n_reads < opt->min_dp || n_reads > opt->max_noisy_reg_cov) { free(read_ids); free(ref_seq); return -1; }
+    // assembly does not need full depth: keep every noisy-region read, subsample the rest evenly
+    if (n_reads > LONGCALLD_DEKNOT_MAX_ASM_READS) {
+        int *kept = (int*)malloc(n_reads * sizeof(int));
+        int n_kept = 0;
+        for (int i = 0; i < n_reads; ++i) {
+            for (int k = 0; k < n_noisy_reads; ++k) {
+                if (noisy_reads[k] == read_ids[i]) { kept[n_kept++] = read_ids[i]; read_ids[i] = -1; break; }
+            }
+        }
+        int n_rest = 0;
+        for (int i = 0; i < n_reads; ++i) if (read_ids[i] >= 0) n_rest++;
+        int want = LONGCALLD_DEKNOT_MAX_ASM_READS - n_kept;
+        if (want > 0 && n_rest > 0) {
+            double step = (want >= n_rest) ? 1.0 : (double)n_rest / (double)want;
+            double next = 0.0; int seen = 0;
+            for (int i = 0; i < n_reads && n_kept < LONGCALLD_DEKNOT_MAX_ASM_READS; ++i) {
+                if (read_ids[i] < 0) continue;
+                if (seen >= (int)next) { kept[n_kept++] = read_ids[i]; next += step; }
+                seen++;
+            }
+        }
+        free(read_ids);
+        read_ids = kept; n_reads = n_kept;
+    }
 
     char **read_strs = (char**)malloc(n_reads * sizeof(char*));
     char **read_names = (char**)malloc(n_reads * sizeof(char*));
@@ -1909,9 +1946,18 @@ int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t no
         for (int iter = 0; iter < 10; ++iter) {
             int extended = 0;
             for (int i = 0; i < rescue_n; ++i) extended |= deknot_extend_ref_window(walk_alns + i, exp_beg, &win_beg, &win_end);
-            if (win_beg < exp_beg) win_beg = exp_beg;
-            if (win_end > exp_end) win_end = exp_end;
+            if (win_beg <= exp_beg) { win_beg = exp_beg; *hit_window_edge = 1; }
+            if (win_end >= exp_end) { win_end = exp_end; *hit_window_edge = 1; }
             if (!extended) break;
+        }
+        if (*hit_window_edge && abort_on_edge) {
+            for (int i = 0; i < rescue_n; ++i) {
+                if (walk_alns[i].target_aln != NULL) free(walk_alns[i].target_aln);
+            }
+            dk_walks_free(walks);
+            for (int i = 0; i < n_reads; ++i) { free(read_strs[i]); free(read_names[i]); }
+            free(read_strs); free(read_names); free(read_ids); free(ref_seq);
+            return -1;
         }
         uint8_t *cons_seqs[2] = {NULL, NULL}; int cons_lens[2] = {0, 0};
         int trim_ok = 1;
@@ -2001,6 +2047,38 @@ int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t no
     for (int i = 0; i < n_reads; ++i) { free(read_strs[i]); free(read_names[i]); }
     free(read_strs); free(read_names); free(read_ids); free(ref_seq);
     return rescue_n;
+}
+
+int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
+                     int n_noisy_reads, int *noisy_reads,
+                     int n_cons_existing, int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs, hts_pos_t *var_reg_beg) {
+    int hit_edge = 0;
+    // long clips at the region are the signature of an SV larger than the small window
+    int n_long_clip = 0;
+    for (int k = 0; k < n_noisy_reads; ++k) {
+        digar_t *d = chunk->digars + noisy_reads[k];
+        if (d->n_digar <= 0) continue;
+        digar1_t *first = d->digars, *last = d->digars + d->n_digar - 1;
+        if ((first->type == BAM_CSOFT_CLIP || first->type == BAM_CHARD_CLIP) && first->len >= 500
+            && d->beg >= noisy_reg_beg - 2000 && d->beg <= noisy_reg_end + 2000) n_long_clip++;
+        else if ((last->type == BAM_CSOFT_CLIP || last->type == BAM_CHARD_CLIP) && last->len >= 500
+            && d->end >= noisy_reg_beg - 2000 && d->end <= noisy_reg_end + 2000) n_long_clip++;
+    }
+    if (n_long_clip >= 2) {
+        return deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, n_noisy_reads, noisy_reads,
+                                     LONGCALLD_DEKNOT_FLANK_LEN, 0, &hit_edge,
+                                     n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg);
+    }
+    int ret = deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, n_noisy_reads, noisy_reads,
+                                    LONGCALLD_DEKNOT_SMALL_FLANK_LEN, 1, &hit_edge,
+                                    n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg);
+    // an indel run crossing the small window's edge means an SV larger than the flank: retry wide
+    if (ret < 0 && hit_edge) {
+        ret = deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, n_noisy_reads, noisy_reads,
+                                    LONGCALLD_DEKNOT_FLANK_LEN, 0, &hit_edge,
+                                    n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg);
+    }
+    return ret;
 }
 
 int collect_noisy_reg_aln_strs(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end, int noisy_reg_i,
