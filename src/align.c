@@ -14,8 +14,118 @@
 #include "math_utils.h"
 #include "align.h"
 #include "kmer.h"
+#include <pthread.h>
+#include <inttypes.h>
 
 extern int LONGCALLD_VERBOSE;
+
+/******************************************
+ * DeKnot local-assembly region statistics *
+ ******************************************/
+// outcome of one assembly attempt (a deknot_sv_rescue_core call that reached the assembler)
+enum {
+    DK_OUT_COMMIT1 = 0, // committed a single consensus
+    DK_OUT_COMMIT2,     // committed two haplotype walks
+    DK_OUT_NO_WALKS,    // assembler returned no walks
+    DK_OUT_MANY_WALKS,  // assembler returned more than two walks
+    DK_OUT_NO_GAIN,     // walks did not improve on the existing consensus count
+    DK_OUT_POOR_ALN,    // a walk failed to align to the expanded reference
+    DK_OUT_HIT_EDGE,    // an indel run crossed the small window edge (retried with the wide flank)
+    DK_OUT_NO_SUPPORT,  // trimmed walks had no supporting noisy-region reads
+    DK_OUT_N
+};
+static const char *dk_out_names[DK_OUT_N] = {"commit_1cons", "commit_2cons", "no_walks", "gt2_walks", "no_gain", "poor_aln", "hit_edge", "no_read_support"};
+// which pass of deknot_sv_rescue invoked the assembler
+enum { DK_PASS_SMALL = 0, DK_PASS_WIDE, DK_PASS_WIDE_RETRY, DK_PASS_N };
+static const char *dk_pass_names[DK_PASS_N] = {"small_flank", "wide_flank", "wide_retry"};
+
+typedef struct {
+    pthread_mutex_t lock; // chunks are processed in parallel (kt_for)
+    // noisy regions handed to deknot_sv_rescue, split by the number of consensus sequences they already had
+    int64_t n_regions, n_regions_cons0, n_regions_cons1;
+    int64_t n_regions_rescued; // regions where local assembly raised n_cons
+    // attempts that stopped before running the assembler
+    int64_t n_skip_no_breakpoint, n_skip_window, n_skip_depth;
+    // attempts that ran the assembler
+    int64_t n_asm, n_asm_pass[DK_PASS_N], n_asm_subsampled;
+    int64_t n_walks_hist[4]; // 0, 1, 2, >=3 walks returned
+    int64_t n_outcome[DK_OUT_N];
+    int64_t reg_len_sum, reg_len_min, reg_len_max; // noisy region length (bp)
+    int64_t win_len_sum, win_len_min, win_len_max; // expanded assembly window length (bp)
+    int64_t n_reads_sum, n_reads_min, n_reads_max; // reads given to the assembler
+    double asm_time_sum, asm_time_max;             // wall seconds inside dk_assemble_walks
+} deknot_stats_t;
+
+static deknot_stats_t dk_stats = { PTHREAD_MUTEX_INITIALIZER };
+
+static void dk_stats_count(int64_t *counter) {
+    pthread_mutex_lock(&dk_stats.lock);
+    (*counter)++;
+    pthread_mutex_unlock(&dk_stats.lock);
+}
+
+static void dk_stats_add_region(int n_cons_existing, int ret) {
+    pthread_mutex_lock(&dk_stats.lock);
+    dk_stats.n_regions++;
+    if (n_cons_existing == 0) dk_stats.n_regions_cons0++; else dk_stats.n_regions_cons1++;
+    if (ret > n_cons_existing) dk_stats.n_regions_rescued++;
+    pthread_mutex_unlock(&dk_stats.lock);
+}
+
+#define DK_STATS_MINMAX(field, v) do { \
+    dk_stats.field##_sum += (v); \
+    if (dk_stats.n_asm == 1 || (v) < dk_stats.field##_min) dk_stats.field##_min = (v); \
+    if (dk_stats.n_asm == 1 || (v) > dk_stats.field##_max) dk_stats.field##_max = (v); \
+} while (0)
+
+// record one assembly attempt and, in verbose mode, print its per-region line
+static void dk_stats_add_attempt(const bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
+                                 hts_pos_t exp_beg, hts_pos_t exp_end, int n_reads, int subsampled,
+                                 int n_walks, double secs, int pass, int outcome) {
+    int64_t reg_len = noisy_reg_end - noisy_reg_beg + 1, win_len = exp_end - exp_beg + 1;
+    pthread_mutex_lock(&dk_stats.lock);
+    dk_stats.n_asm++;
+    dk_stats.n_asm_pass[pass]++;
+    if (subsampled) dk_stats.n_asm_subsampled++;
+    dk_stats.n_walks_hist[n_walks < 3 ? n_walks : 3]++;
+    dk_stats.n_outcome[outcome]++;
+    DK_STATS_MINMAX(reg_len, reg_len);
+    DK_STATS_MINMAX(win_len, win_len);
+    DK_STATS_MINMAX(n_reads, (int64_t)n_reads);
+    dk_stats.asm_time_sum += secs;
+    if (secs > dk_stats.asm_time_max) dk_stats.asm_time_max = secs;
+    pthread_mutex_unlock(&dk_stats.lock);
+    if (LONGCALLD_VERBOSE >= 1)
+        fprintf(stderr, "DeKnotAsm %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " pass=%s win=%" PRIi64 "-%" PRIi64 " (%" PRIi64 ") reads=%d%s walks=%d time=%.2fs outcome=%s\n",
+                chunk->tname, noisy_reg_beg, noisy_reg_end, reg_len, dk_pass_names[pass], exp_beg, exp_end, win_len,
+                n_reads, subsampled ? "(subsampled)" : "", n_walks, secs, dk_out_names[outcome]);
+}
+
+#undef DK_STATS_MINMAX
+
+void deknot_print_stats(void) {
+    deknot_stats_t *s = &dk_stats;
+    pthread_mutex_lock(&s->lock);
+    _err_info("DeKnot local assembly summary:\n");
+    fprintf(stderr, "  candidate noisy regions:  %" PRIi64 " (no consensus: %" PRIi64 ", one consensus: %" PRIi64 "), rescued: %" PRIi64 "\n",
+            s->n_regions, s->n_regions_cons0, s->n_regions_cons1, s->n_regions_rescued);
+    fprintf(stderr, "  skipped before assembly:  no breakpoint signature: %" PRIi64 ", window empty/too long: %" PRIi64 ", depth out of range: %" PRIi64 "\n",
+            s->n_skip_no_breakpoint, s->n_skip_window, s->n_skip_depth);
+    fprintf(stderr, "  assembly attempts:        %" PRIi64 " (small flank: %" PRIi64 ", wide flank: %" PRIi64 ", wide retry: %" PRIi64 "), read set subsampled: %" PRIi64 "\n",
+            s->n_asm, s->n_asm_pass[DK_PASS_SMALL], s->n_asm_pass[DK_PASS_WIDE], s->n_asm_pass[DK_PASS_WIDE_RETRY], s->n_asm_subsampled);
+    if (s->n_asm > 0) {
+        double n = (double)s->n_asm;
+        fprintf(stderr, "  noisy region length:      min %" PRIi64 ", mean %.0f, max %" PRIi64 " bp\n", s->reg_len_min, s->reg_len_sum / n, s->reg_len_max);
+        fprintf(stderr, "  assembly window length:   min %" PRIi64 ", mean %.0f, max %" PRIi64 " bp\n", s->win_len_min, s->win_len_sum / n, s->win_len_max);
+        fprintf(stderr, "  reads per assembly:       min %" PRIi64 ", mean %.1f, max %" PRIi64 "\n", s->n_reads_min, s->n_reads_sum / n, s->n_reads_max);
+        fprintf(stderr, "  walks returned:           0: %" PRIi64 ", 1: %" PRIi64 ", 2: %" PRIi64 ", >=3: %" PRIi64 "\n",
+                s->n_walks_hist[0], s->n_walks_hist[1], s->n_walks_hist[2], s->n_walks_hist[3]);
+        fprintf(stderr, "  outcomes:                ");
+        for (int i = 0; i < DK_OUT_N; ++i) fprintf(stderr, " %s: %" PRIi64 "%s", dk_out_names[i], s->n_outcome[i], i + 1 < DK_OUT_N ? "," : "\n");
+        fprintf(stderr, "  assembly time:            total %.1f s, mean %.2f s, max %.2f s\n", s->asm_time_sum, s->asm_time_sum / n, s->asm_time_max);
+    }
+    pthread_mutex_unlock(&s->lock);
+}
 
 
 // INS/DEL : left-most
@@ -1832,7 +1942,7 @@ static void deknot_trim_aln(aln_str_t *as, hts_pos_t aln_ref_beg, hts_pos_t win_
 // noisy region (extended over any indel run that crosses its boundary, so SVs survive intact).
 // commits results into clu_n_seqs/clu_read_ids/aln_strs only when it improves on n_cons_existing.
 static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
-                     int n_noisy_reads, int *noisy_reads, hts_pos_t flank_len, int abort_on_edge, int *hit_window_edge,
+                     int n_noisy_reads, int *noisy_reads, hts_pos_t flank_len, int abort_on_edge, int *hit_window_edge, int pass,
                      int n_cons_existing, int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs, hts_pos_t *var_reg_beg) {
     // a region that already has a consensus is only worth re-assembling when it shows a
     // breakpoint signature: multiple reads that fail to fully span it (clips/gaps at the edges)
@@ -1844,7 +1954,7 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
             free(rseq);
             if (!LONGCALLD_NOISY_IS_BOTH_COVER(rcover)) n_nonfull++;
         }
-        if (n_nonfull < 2) return -1;
+        if (n_nonfull < 2) { dk_stats_count(&dk_stats.n_skip_no_breakpoint); return -1; }
     }
     *hit_window_edge = 0;
     hts_pos_t exp_beg = noisy_reg_beg - flank_len;
@@ -1852,7 +1962,7 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
     if (exp_beg < 1) exp_beg = 1;
     uint8_t *ref_seq = NULL;
     int ref_seq_len = collect_reg_ref_bseq(chunk, &exp_beg, &exp_end, &ref_seq);
-    if (ref_seq_len <= 0 || ref_seq_len > LONGCALLD_DEKNOT_MAX_WIN) { free(ref_seq); return n_cons_existing; }
+    if (ref_seq_len <= 0 || ref_seq_len > LONGCALLD_DEKNOT_MAX_WIN) { dk_stats_count(&dk_stats.n_skip_window); free(ref_seq); return n_cons_existing; }
 
     int n_reads = 0;
     int *read_ids = (int*)malloc(chunk->n_reads * sizeof(int));
@@ -1861,9 +1971,11 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         digar_t *d = chunk->digars + i;
         if (d->beg <= exp_end && d->end >= exp_beg) read_ids[n_reads++] = i;
     }
-    if (n_reads < opt->min_dp || n_reads > opt->max_noisy_reg_cov) { free(read_ids); free(ref_seq); return -1; }
+    if (n_reads < opt->min_dp || n_reads > opt->max_noisy_reg_cov) { dk_stats_count(&dk_stats.n_skip_depth); free(read_ids); free(ref_seq); return -1; }
     // assembly does not need full depth: keep every noisy-region read, subsample the rest evenly
+    int subsampled = 0;
     if (n_reads > LONGCALLD_DEKNOT_MAX_ASM_READS) {
+        subsampled = 1;
         int *kept = (int*)malloc(n_reads * sizeof(int));
         int n_kept = 0;
         for (int i = 0; i < n_reads; ++i) {
@@ -1901,11 +2013,19 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
     }
     dk_opt_t dk_opt; dk_opt_init(&dk_opt);
     dk_opt.check_strand = (opt->is_ont != 0);
+    double asm_t0 = realtime();
     dk_walks_t *walks = dk_assemble_walks(&dk_opt, read_strs, read_names, n_reads);
+    double asm_secs = realtime() - asm_t0;
+    int n_walks = (walks == NULL) ? 0 : walks->n_walks;
+    int outcome;
 
     int rescue_n = 0;
     if (walks != NULL && walks->n_walks >= 1 && walks->n_walks <= 2) rescue_n = walks->n_walks;
     if (rescue_n <= n_cons_existing) {
+        if (n_walks == 0) outcome = DK_OUT_NO_WALKS;
+        else if (n_walks > 2) outcome = DK_OUT_MANY_WALKS;
+        else outcome = DK_OUT_NO_GAIN;
+        dk_stats_add_attempt(chunk, noisy_reg_beg, noisy_reg_end, exp_beg, exp_end, n_reads, subsampled, n_walks, asm_secs, pass, outcome);
         if (walks != NULL) dk_walks_free(walks);
         for (int i = 0; i < n_reads; ++i) { free(read_strs[i]); free(read_names[i]); }
         free(read_strs); free(read_names); free(read_ids); free(ref_seq);
@@ -1951,6 +2071,7 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
             if (!extended) break;
         }
         if (*hit_window_edge && abort_on_edge) {
+            dk_stats_add_attempt(chunk, noisy_reg_beg, noisy_reg_end, exp_beg, exp_end, n_reads, subsampled, n_walks, asm_secs, pass, DK_OUT_HIT_EDGE);
             for (int i = 0; i < rescue_n; ++i) {
                 if (walk_alns[i].target_aln != NULL) free(walk_alns[i].target_aln);
             }
@@ -2035,6 +2156,9 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         }
         if (rescue_n == 1 && clu_n_seqs[0] == 0) rescue_n = 0;
         if (!trim_ok) rescue_n = 0;
+        if (rescue_n == 0) outcome = DK_OUT_NO_SUPPORT;
+        else if (rescue_n <= n_cons_existing) outcome = DK_OUT_NO_GAIN;
+        else outcome = (rescue_n == 2) ? DK_OUT_COMMIT2 : DK_OUT_COMMIT1;
         if (rescue_n <= n_cons_existing) rescue_n = -1;
         *var_reg_beg = win_beg;
     } else {
@@ -2042,7 +2166,9 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
             if (walk_alns[i].target_aln != NULL) free(walk_alns[i].target_aln);
         }
         rescue_n = -1;
+        outcome = DK_OUT_POOR_ALN;
     }
+    dk_stats_add_attempt(chunk, noisy_reg_beg, noisy_reg_end, exp_beg, exp_end, n_reads, subsampled, n_walks, asm_secs, pass, outcome);
     dk_walks_free(walks);
     for (int i = 0; i < n_reads; ++i) { free(read_strs[i]); free(read_names[i]); }
     free(read_strs); free(read_names); free(read_ids); free(ref_seq);
@@ -2064,20 +2190,24 @@ int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t no
         else if ((last->type == BAM_CSOFT_CLIP || last->type == BAM_CHARD_CLIP) && last->len >= 500
             && d->end >= noisy_reg_beg - 2000 && d->end <= noisy_reg_end + 2000) n_long_clip++;
     }
+    int ret;
     if (n_long_clip >= 2) {
-        return deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, n_noisy_reads, noisy_reads,
-                                     LONGCALLD_DEKNOT_FLANK_LEN, 0, &hit_edge,
-                                     n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg);
-    }
-    int ret = deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, n_noisy_reads, noisy_reads,
-                                    LONGCALLD_DEKNOT_SMALL_FLANK_LEN, 1, &hit_edge,
+        ret = deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, n_noisy_reads, noisy_reads,
+                                    LONGCALLD_DEKNOT_FLANK_LEN, 0, &hit_edge, DK_PASS_WIDE,
                                     n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg);
+        dk_stats_add_region(n_cons_existing, ret);
+        return ret;
+    }
+    ret = deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, n_noisy_reads, noisy_reads,
+                                LONGCALLD_DEKNOT_SMALL_FLANK_LEN, 1, &hit_edge, DK_PASS_SMALL,
+                                n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg);
     // an indel run crossing the small window's edge means an SV larger than the flank: retry wide
     if (ret < 0 && hit_edge) {
         ret = deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, n_noisy_reads, noisy_reads,
-                                    LONGCALLD_DEKNOT_FLANK_LEN, 0, &hit_edge,
+                                    LONGCALLD_DEKNOT_FLANK_LEN, 0, &hit_edge, DK_PASS_WIDE_RETRY,
                                     n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg);
     }
+    dk_stats_add_region(n_cons_existing, ret);
     return ret;
 }
 

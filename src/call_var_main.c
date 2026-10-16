@@ -1023,6 +1023,7 @@ int call_var_main(int argc, char *argv[]) {
     // start to work !!!
     pl.opt = opt;
     kt_pipeline(opt->pl_threads, call_var_worker_pipeline, &pl, 3);
+    if (opt->use_deknot) deknot_print_stats();
     if (opt->out_aln_fp != NULL) hts_close(opt->out_aln_fp);
     if (opt->out_vcf != NULL) {
         if (opt->vcf_hdr != NULL) bcf_hdr_destroy(opt->vcf_hdr);
