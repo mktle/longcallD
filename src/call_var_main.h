@@ -45,6 +45,13 @@
 #define LONGCALLD_DEKNOT_FLANK_LEN 50000 // expansion around a noisy region for local assembly
 #define LONGCALLD_DEKNOT_MAX_WIN 160000 // max expanded window size for local assembly
 #define LONGCALLD_DEKNOT_MAX_ASM_READS 150 // subsample the local-assembly read set beyond this
+// paired-breakpoint rescue: both breakpoints of a large SV are known (SA tags or placed clipped tails), so one
+// window is assembled over both; a deletion walk is short, so the window may be larger than for a single region
+#define LONGCALLD_DEKNOT_PAIR_FLANK_LEN 25000 // flank around the breakpoint pair
+#define LONGCALLD_DEKNOT_PAIR_MAX_WIN 250000 // max expanded window size for a paired-breakpoint assembly
+#define LONGCALLD_DEKNOT_PAIR_MAX_DIST 200000 // the partner breakpoint is searched within this distance of the noisy region
+#define LONGCALLD_DEKNOT_PAIR_MAX_ASM_READS 300 // subsample the paired-window read set beyond this
+#define LONGCALLD_DEKNOT_PAIR_MIN_CLIP 500 // reads with a clip this long carry the partner breakpoint (SA tag or placed tail)
 #define LONGCALLD_NOISY_REG_READS 2 // >= 5 reads supporting noisy region
 // #define LONGCALLD_NOISY_REG_RATIO 0.20 // >= 25% reads supporting noisy region
 

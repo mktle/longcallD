@@ -1104,9 +1104,27 @@ void collect_digars_from_bam(bam_chunk_t *chunk, const struct call_var_pl_t *pl)
     }
     // fprintf(stderr, "n_valid: %d, min: %d, 1st quartile: %d, median: %d, 3rd quartile: %d, max: %d\n", n_valid_quals, chunk->min_qual, chunk->first_quar_qual, chunk->median_qual, chunk->third_quar_qual, chunk->max_qual);
     if (LONGCALLD_VERBOSE < 2) {
-        for (int i = 0; i < chunk->m_reads; ++i) bam_destroy1(chunk->reads[i]);
-        free(chunk->reads);
+        // the BAM records are not needed past the digars, except that the DeKnot breakpoint pairing
+        // (deknot_find_partner) reads the SA tag and clipped tail of reads with a long clip: keep only those
+        // records (freed by deknot_free_kept_reads at the end of collect_var_main), set every other slot to NULL
+        for (int i = 0; i < chunk->m_reads; ++i) {
+            int keep = 0;
+            if (opt->use_deknot && i < chunk->n_reads && !chunk->is_skipped[i] && chunk->digars[i].n_digar > 0) {
+                digar1_t *first = chunk->digars[i].digars, *last = chunk->digars[i].digars + chunk->digars[i].n_digar - 1;
+                if ((first->type == BAM_CSOFT_CLIP || first->type == BAM_CHARD_CLIP) && first->len >= LONGCALLD_DEKNOT_PAIR_MIN_CLIP) keep = 1;
+                if ((last->type == BAM_CSOFT_CLIP || last->type == BAM_CHARD_CLIP) && last->len >= LONGCALLD_DEKNOT_PAIR_MIN_CLIP) keep = 1;
+            }
+            if (!keep) { bam_destroy1(chunk->reads[i]); chunk->reads[i] = NULL; }
+        }
+        if (!opt->use_deknot) { free(chunk->reads); chunk->reads = NULL; }
     }
+}
+
+// free the BAM records kept for the DeKnot breakpoint pairing (LONGCALLD_VERBOSE < 2 with --deknot)
+static void deknot_free_kept_reads(bam_chunk_t *chunk, const call_var_opt_t *opt) {
+    if (LONGCALLD_VERBOSE >= 2 || !opt->use_deknot || chunk->reads == NULL) return;
+    for (int i = 0; i < chunk->m_reads; ++i) if (chunk->reads[i] != NULL) bam_destroy1(chunk->reads[i]);
+    free(chunk->reads); chunk->reads = NULL;
 }
 
 // XXX should be digar->pos-1 for INS/DEL
@@ -2644,8 +2662,53 @@ int merge_vars(var_t *old_vars, var_t *add_vars) {
 // 4. (*optional*) re-generate consensus sequence using all reads
 // 5. collect candidate variants based on MSA of ref + cons1 + cons2
 // 6. update cand_var & read_var_profile
+// DeKnot paired-breakpoint rescue (src/align.c)
+int deknot_find_partner(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
+                        int n_noisy_reads, int *noisy_reads, hts_pos_t *pair_beg, hts_pos_t *pair_end);
+int deknot_sv_rescue_paired(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
+                            hts_pos_t pair_beg, hts_pos_t pair_end, int n_noisy_reads, int *noisy_reads,
+                            int n_cons_existing, int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs, hts_pos_t *var_reg_beg);
+
+static int deknot_rescue_enabled(const call_var_opt_t *opt) {
+    return opt->use_deknot && !opt->out_somatic && !(opt->refine_bam && opt->out_aln_fp != NULL);
+}
+
+// before any noisy region is called: for each region whose long-clipped reads agree on a partner breakpoint
+// (the other end of a large SV), record the partner interval and the noisy region at it, if any. the pairing is
+// made symmetric so that whichever breakpoint region is processed first assembles one window over both.
+static void deknot_pair_noisy_regs(bam_chunk_t *chunk, const call_var_opt_t *opt, hts_pos_t **pair_beg, hts_pos_t **pair_end, int **pair_reg) {
+    cgranges_t *regs = chunk->chunk_noisy_regs; int n = regs->n_r;
+    *pair_beg = (hts_pos_t*)malloc(n * sizeof(hts_pos_t)); *pair_end = (hts_pos_t*)malloc(n * sizeof(hts_pos_t));
+    *pair_reg = (int*)malloc(n * sizeof(int));
+    for (int i = 0; i < n; ++i) { (*pair_beg)[i] = -1; (*pair_end)[i] = -1; (*pair_reg)[i] = -1; }
+    for (int i = 0; i < n; ++i) {
+        hts_pos_t beg = cr_start(regs, i), end = cr_end(regs, i);
+        if (end - beg + 1 > LONGCALLD_DEKNOT_MAX_NOISY_REG_LEN) continue;
+        int *reads = NULL; int n_reads = collect_noisy_reg_reads1(chunk, beg, end, i, &reads);
+        hts_pos_t pb = -1, pe = -1; int n_sup = 0;
+        if (n_reads > 0 && n_reads <= opt->max_noisy_reg_cov) n_sup = deknot_find_partner(opt, chunk, beg, end, n_reads, reads, &pb, &pe);
+        free(reads);
+        if (n_sup < 2) continue;
+        (*pair_beg)[i] = pb; (*pair_end)[i] = pe;
+        for (int j = 0; j < n; ++j) { // the noisy region at the partner breakpoint, if any
+            if (j == i) continue;
+            if (cr_start(regs, j) <= pe + 2000 && cr_end(regs, j) >= pb - 2000) { (*pair_reg)[i] = j; break; }
+        }
+        if (LONGCALLD_VERBOSE >= 1)
+            fprintf(stderr, "DeKnotPair %s:%" PRIi64 "-%" PRIi64 " partner %" PRIi64 "-%" PRIi64 " (%d reads) partner_region=%d\n",
+                    chunk->tname, beg, end, pb, pe, n_sup, (*pair_reg)[i]);
+    }
+    for (int i = 0; i < n; ++i) {
+        int j = (*pair_reg)[i];
+        if (j >= 0 && (*pair_beg)[j] < 0) { (*pair_beg)[j] = cr_start(regs, i); (*pair_end)[j] = cr_end(regs, i); (*pair_reg)[j] = i; }
+    }
+}
+
 // call variant for noisy_reg_i, return 0 if no variant is called
-int collect_noisy_vars1(bam_chunk_t *chunk, const call_var_opt_t *opt, int noisy_reg_i) {
+// pair_beg/pair_end/pair_reg (per noisy region, from deknot_pair_noisy_regs; NULL without --deknot): partner breakpoint
+// interval and the noisy region there; a committed paired rescue marks the partner region done in noisy_reg_is_done
+int collect_noisy_vars1(bam_chunk_t *chunk, const call_var_opt_t *opt, int noisy_reg_i,
+                        hts_pos_t *pair_beg, hts_pos_t *pair_end, int *pair_reg, int *noisy_reg_is_done) {
     cgranges_t *noisy_regs = chunk->chunk_noisy_regs;
     hts_pos_t noisy_reg_beg = cr_start(noisy_regs, noisy_reg_i), noisy_reg_end = cr_end(noisy_regs, noisy_reg_i);
     uint8_t *ref_seq = NULL; int ref_seq_len = collect_reg_ref_bseq(chunk, &noisy_reg_beg, &noisy_reg_end, &ref_seq);
@@ -2678,12 +2741,71 @@ int collect_noisy_vars1(bam_chunk_t *chunk, const call_var_opt_t *opt, int noisy
             aln_strs[i][j].target_aln = NULL; aln_strs[i][j].query_aln = NULL; aln_strs[i][j].aln_len = 0;
         }
     }
-    n_cons = collect_noisy_reg_aln_strs(opt, chunk, noisy_reg_beg, noisy_reg_end, noisy_reg_i, n_noisy_reads, noisy_reads, ref_seq, ref_seq_len, // both cons_seqs and msa_seqs are separated for n_cons==2
-                                        clu_n_seqs, clu_read_ids, aln_strs);
-    if (LONGCALLD_VERBOSE >= 2) fprintf(stderr, "n_cons: %d\n", n_cons);
-    free(ref_seq);
     hts_pos_t var_reg_beg = noisy_reg_beg;
-    if (opt->use_deknot && n_cons <= 1 && !opt->out_somatic && !(opt->refine_bam && opt->out_aln_fp != NULL)) {
+    int paired = 0;
+    if (pair_beg != NULL && pair_beg[noisy_reg_i] >= 0 && deknot_rescue_enabled(opt)) {
+        // both breakpoints of a large SV are known: assemble one window over both, with the reads of both
+        // breakpoint regions, before (instead of) the ordinary consensus of this region alone
+        hts_pos_t pb = pair_beg[noisy_reg_i], pe = pair_end[noisy_reg_i];
+        int *pair_reads = NULL; int n_pair_reads = collect_noisy_reg_reads1(chunk, pb, pe, noisy_reg_i, &pair_reads);
+        int *all_reads = (int*)malloc((n_noisy_reads + n_pair_reads) * sizeof(int)); int n_all = 0;
+        uint8_t *in_set = (uint8_t*)calloc(chunk->n_reads, sizeof(uint8_t));
+        for (int i = 0; i < n_noisy_reads; ++i) { all_reads[n_all++] = noisy_reads[i]; in_set[noisy_reads[i]] = 1; }
+        for (int i = 0; i < n_pair_reads; ++i) if (!in_set[pair_reads[i]]) { all_reads[n_all++] = pair_reads[i]; in_set[pair_reads[i]] = 1; }
+        free(in_set); free(pair_reads);
+        int *p_clu_n_seqs = (int*)calloc(2, sizeof(int)); int **p_clu_read_ids = (int**)malloc(2 * sizeof(int*));
+        aln_str_t **p_aln_strs = (aln_str_t**)malloc(2 * sizeof(aln_str_t*));
+        for (int i = 0; i < 2; ++i) {
+            p_clu_read_ids[i] = NULL;
+            p_aln_strs[i] = (aln_str_t*)malloc((1 + n_all * 2) * sizeof(aln_str_t));
+            for (int j = 0; j < 1+n_all*2; ++j) { p_aln_strs[i][j].target_aln = NULL; p_aln_strs[i][j].query_aln = NULL; p_aln_strs[i][j].aln_len = 0; }
+        }
+        int rescue_n_cons = deknot_sv_rescue_paired(opt, chunk, noisy_reg_beg, noisy_reg_end, pb, pe, n_all, all_reads,
+                                                    0, p_clu_n_seqs, p_clu_read_ids, p_aln_strs, &var_reg_beg);
+        if (rescue_n_cons >= 1) {
+            if (LONGCALLD_VERBOSE >= 1)
+                fprintf(stderr, "DeKnotPaired %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " partner %" PRIi64 "-%" PRIi64 " %d reads n_cons: %d clu: %d,%d\n",
+                        chunk->tname, noisy_reg_beg, noisy_reg_end, noisy_reg_end-noisy_reg_beg+1, pb, pe, n_all, rescue_n_cons, p_clu_n_seqs[0], p_clu_n_seqs[1]);
+            // the paired result replaces this region's read set and slots; the partner region is covered by it
+            for (int i = 0; i < 2; ++i) free(aln_strs[i]);
+            free(aln_strs); free(clu_n_seqs); free(clu_read_ids); free(noisy_reads);
+            aln_strs = p_aln_strs; clu_n_seqs = p_clu_n_seqs; clu_read_ids = p_clu_read_ids;
+            noisy_reads = all_reads; n_noisy_reads = n_all;
+            n_cons = rescue_n_cons; paired = 1;
+            // the partner region was called by this window: do not call it again on its own from reads that are
+            // mis-aligned across the SV. with both haplotypes committed, the same holds for every noisy region
+            // inside the SV span; with one, the other haplotype's regions inside the span are still called on their own
+            if (noisy_reg_is_done != NULL) {
+                hts_pos_t span_beg = pb < noisy_reg_beg ? pb : noisy_reg_beg, span_end = pe > noisy_reg_end ? pe : noisy_reg_end;
+                cgranges_t *regs = chunk->chunk_noisy_regs;
+                for (int j = 0; j < regs->n_r; ++j) {
+                    if (j == noisy_reg_i || noisy_reg_is_done[j]) continue;
+                    if (j == pair_reg[noisy_reg_i] || (rescue_n_cons == 2 && cr_start(regs, j) >= span_beg && cr_end(regs, j) <= span_end)) {
+                        noisy_reg_is_done[j] = 1;
+                        if (LONGCALLD_VERBOSE >= 1) fprintf(stderr, "DeKnotPairedSkip %s:%d-%d inside %" PRIi64 "-%" PRIi64 "\n", chunk->tname, cr_start(regs, j), cr_end(regs, j), span_beg, span_end);
+                    }
+                }
+            }
+        } else {
+            if (LONGCALLD_VERBOSE >= 1)
+                fprintf(stderr, "DeKnotPairedFail %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " partner %" PRIi64 "-%" PRIi64 " %d reads\n",
+                        chunk->tname, noisy_reg_beg, noisy_reg_end, noisy_reg_end-noisy_reg_beg+1, pb, pe, n_all);
+            for (int i = 0; i < 2; ++i) {
+                if (p_clu_read_ids[i] != NULL) free(p_clu_read_ids[i]);
+                for (int j = 0; j < 1+n_all*2; ++j) if (p_aln_strs[i][j].target_aln != NULL) free(p_aln_strs[i][j].target_aln);
+                free(p_aln_strs[i]);
+            }
+            free(p_aln_strs); free(p_clu_n_seqs); free(p_clu_read_ids); free(all_reads);
+            var_reg_beg = noisy_reg_beg;
+        }
+    }
+    if (!paired) {
+        n_cons = collect_noisy_reg_aln_strs(opt, chunk, noisy_reg_beg, noisy_reg_end, noisy_reg_i, n_noisy_reads, noisy_reads, ref_seq, ref_seq_len, // both cons_seqs and msa_seqs are separated for n_cons==2
+                                            clu_n_seqs, clu_read_ids, aln_strs);
+        if (LONGCALLD_VERBOSE >= 2) fprintf(stderr, "n_cons: %d\n", n_cons);
+    }
+    free(ref_seq);
+    if (!paired && n_cons <= 1 && deknot_rescue_enabled(opt)) {
         int rescue_n_cons = deknot_sv_rescue(opt, chunk, noisy_reg_beg, noisy_reg_end, n_noisy_reads, noisy_reads, n_cons, clu_n_seqs, clu_read_ids, aln_strs, &var_reg_beg);
         if (rescue_n_cons >= 0) {
             if (LONGCALLD_VERBOSE >= 1)
@@ -2941,8 +3063,10 @@ void collect_var_main(const call_var_pl_t *pl, bam_chunk_t *chunk) {
             fprintf(stderr, "NoisyRegion: %s:%d-%d (%d)\n", chunk->tname, cr_start(chunk->chunk_noisy_regs, i), cr_end(chunk->chunk_noisy_regs, i), cr_label(chunk->chunk_noisy_regs, i));
         }
     }
-    if (chunk->n_cand_vars == 0 && (chunk->chunk_noisy_regs == NULL || chunk->chunk_noisy_regs->n_r == 0))
+    if (chunk->n_cand_vars == 0 && (chunk->chunk_noisy_regs == NULL || chunk->chunk_noisy_regs->n_r == 0)) {
+        deknot_free_kept_reads(chunk, opt);
         return; // no variant to be called
+    }
     if (chunk->n_cand_vars > 0) { // XXX what if only have homozygous vars
         // 3.1. collect clean region read-wise var profiles
         chunk->read_var_profile = collect_read_var_profile(opt, chunk);
@@ -2961,12 +3085,23 @@ void collect_var_main(const call_var_pl_t *pl, bam_chunk_t *chunk) {
         int *sorted_noisy_regs = sort_noisy_regs(chunk);
         // for each noisy region, call variants and update read_var_profile, then update phasing/haplotype information
         int *noisy_reg_is_done = (int*)calloc(chunk->chunk_noisy_regs->n_r, sizeof(int));
+        // with --deknot: breakpoint pairs of large SVs, found once per chunk
+        hts_pos_t *pair_beg = NULL, *pair_end = NULL; int *pair_reg = NULL;
+        if (deknot_rescue_enabled(opt)) {
+            deknot_pair_noisy_regs(chunk, opt, &pair_beg, &pair_end, &pair_reg);
+            // breakpoint-pair regions first (stable), so the SV span is assembled before the regions inside it are called
+            int n_r = chunk->chunk_noisy_regs->n_r, n_first = 0;
+            int *reordered = (int*)malloc(n_r * sizeof(int));
+            for (int i = 0; i < n_r; ++i) if (pair_beg[sorted_noisy_regs[i]] >= 0) reordered[n_first++] = sorted_noisy_regs[i];
+            for (int i = 0; i < n_r; ++i) if (pair_beg[sorted_noisy_regs[i]] < 0) reordered[n_first++] = sorted_noisy_regs[i];
+            free(sorted_noisy_regs); sorted_noisy_regs = reordered;
+        }
         while (1) {
             int new_region_is_done = 0, new_var = 0;
             for (int i = 0; i < chunk->chunk_noisy_regs->n_r; ++i) {
                 int noisy_reg_i = sorted_noisy_regs[i];
                 if (noisy_reg_is_done[noisy_reg_i]) continue;
-                int ret = collect_noisy_vars1(chunk, pl->opt, noisy_reg_i);
+                int ret = collect_noisy_vars1(chunk, pl->opt, noisy_reg_i, pair_beg, pair_end, pair_reg, noisy_reg_is_done);
                 if (ret >= 0) {
                     noisy_reg_is_done[noisy_reg_i] = 1; new_region_is_done = 1;
                     if (ret > 0) {
@@ -2986,7 +3121,9 @@ void collect_var_main(const call_var_pl_t *pl, bam_chunk_t *chunk) {
             if (new_region_is_done == 0) break;
         }
         free(sorted_noisy_regs); free(noisy_reg_is_done);
+        if (pair_beg != NULL) { free(pair_beg); free(pair_end); free(pair_reg); }
     }
+    deknot_free_kept_reads(chunk, opt);
     // 5. call somatic variants based on phased reads
     if (opt->out_somatic == 1) collect_somatic_var(chunk, opt);
 }

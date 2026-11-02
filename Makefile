@@ -88,7 +88,7 @@ endif
 
 CFLAGS = $(OPT_FLAGS) $(EXTRA_FLAGS) -DLONGCALLD_VERSION=\"$(LONGCALLD_VERSION)\"
 
-BIN_LDFLAGS =
+BIN_LDFLAGS = -rdynamic
 
 ifeq ($(UNAME_S),Linux)
     BIN_LDFLAGS += -no-pie
