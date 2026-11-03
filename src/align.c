@@ -33,9 +33,10 @@ enum {
     DK_OUT_POOR_ALN,    // a walk failed to align to the expanded reference
     DK_OUT_HIT_EDGE,    // an indel run crossed the small window edge (retried with the wide flank)
     DK_OUT_NO_SUPPORT,  // trimmed walks had no supporting noisy-region reads
+    DK_OUT_PAIR_NO_SV,  // paired pass: no walk carries the SV the breakpoint pair predicts
     DK_OUT_N
 };
-static const char *dk_out_names[DK_OUT_N] = {"commit_1cons", "commit_2cons", "no_walks", "gt2_walks_none_span", "no_gain", "poor_aln", "hit_edge", "no_read_support"};
+static const char *dk_out_names[DK_OUT_N] = {"commit_1cons", "commit_2cons", "no_walks", "gt2_walks_none_span", "no_gain", "poor_aln", "hit_edge", "no_read_support", "paired_no_predicted_sv"};
 // which pass of deknot_sv_rescue invoked the assembler
 enum { DK_PASS_SMALL = 0, DK_PASS_WIDE, DK_PASS_WIDE_RETRY, DK_PASS_PAIRED, DK_PASS_N };
 static const char *dk_pass_names[DK_PASS_N] = {"small_flank", "wide_flank", "wide_retry", "paired"};
@@ -67,6 +68,9 @@ typedef struct {
     // two-walk results collapsed to one consensus because the walks were near-identical over the noisy region
     int64_t n_collapsed, n_collapsed_outcome[DK_OUT_N];
     int64_t n_outcome[DK_OUT_N];
+    // paired-breakpoint pass: regions with a partner, attempts that reached the assembler, commits carrying the
+    // predicted SV, attempts rejected by the SV gate, attempts rejected before assembly (window/depth)
+    int64_t n_pair_regions, n_pair_asm, n_pair_commit_sv, n_pair_gate_reject, n_pair_pre_reject;
     double outcome_time_sum[DK_OUT_N];  // wall seconds inside dk_assemble_walks, per outcome
     int64_t outcome_reads_sum[DK_OUT_N]; // reads given to the assembler, per outcome
     int64_t reg_len_sum, reg_len_min, reg_len_max; // noisy region length (bp)
@@ -118,6 +122,11 @@ static void dk_stats_add_attempt(const bam_chunk_t *chunk, hts_pos_t noisy_reg_b
     if (sel != DK_SEL_NONE) { dk_stats.n_sel[sel]++; dk_stats.n_sel_outcome[sel][outcome]++; }
     if (collapsed) { dk_stats.n_collapsed++; dk_stats.n_collapsed_outcome[outcome]++; }
     dk_stats.n_outcome[outcome]++;
+    if (pass == DK_PASS_PAIRED) {
+        dk_stats.n_pair_asm++;
+        if (outcome == DK_OUT_COMMIT1 || outcome == DK_OUT_COMMIT2) dk_stats.n_pair_commit_sv++;
+        else if (outcome == DK_OUT_PAIR_NO_SV) dk_stats.n_pair_gate_reject++;
+    }
     dk_stats.outcome_time_sum[outcome] += secs;
     dk_stats.outcome_reads_sum[outcome] += n_reads;
     DK_STATS_MINMAX(reg_len, reg_len);
@@ -146,6 +155,8 @@ void deknot_print_stats(void) {
             s->n_skip_no_breakpoint, s->n_skip_window, s->n_skip_depth);
     fprintf(stderr, "  assembly attempts:        %" PRIi64 " (small flank: %" PRIi64 ", wide flank: %" PRIi64 ", wide retry: %" PRIi64 ", paired breakpoints: %" PRIi64 "), read set subsampled: %" PRIi64 "\n",
             s->n_asm, s->n_asm_pass[DK_PASS_SMALL], s->n_asm_pass[DK_PASS_WIDE], s->n_asm_pass[DK_PASS_WIDE_RETRY], s->n_asm_pass[DK_PASS_PAIRED], s->n_asm_subsampled);
+    fprintf(stderr, "  paired breakpoints:       regions paired: %" PRIi64 ", attempts: %" PRIi64 ", committed with predicted SV: %" PRIi64 ", rejected by SV gate: %" PRIi64 ", rejected before assembly: %" PRIi64 "\n",
+            s->n_pair_regions, s->n_pair_asm, s->n_pair_commit_sv, s->n_pair_gate_reject, s->n_pair_pre_reject);
     if (s->n_asm > 0) {
         double n = (double)s->n_asm;
         fprintf(stderr, "  noisy region length:      min %" PRIi64 ", mean %.0f, max %" PRIi64 " bp\n", s->reg_len_min, s->reg_len_sum / n, s->reg_len_max);
@@ -2100,6 +2111,33 @@ static int deknot_align_walk(const call_var_opt_t *opt, uint8_t *ref_seq, int re
     return 1;
 }
 
+#define LONGCALLD_DEKNOT_PAIR_MIN_SV 5000 // a breakpoint pair predicts an indel of at least this, or half the breakpoint distance
+#define LONGCALLD_DEKNOT_PAIR_TRIM_FLANK 500 // variant window flank around the breakpoints and the predicted SV in the paired pass
+
+// longest indel run of at least min_sv bp in a walk-vs-ref alignment (ref coordinate of column 0: aln_ref_beg) whose
+// reference span overlaps [gap_beg, gap_end]; returns its length (0: none) and span (a deletion: the deleted
+// reference bases; an insertion: the two reference bases around it)
+static int deknot_walk_sv_span(aln_str_t *as, hts_pos_t aln_ref_beg, hts_pos_t gap_beg, hts_pos_t gap_end, hts_pos_t min_sv,
+                               hts_pos_t *sv_beg, hts_pos_t *sv_end) {
+    hts_pos_t ref_pos = aln_ref_beg; // reference position of the next reference base
+    int best = 0, c = 0;
+    while (c < as->aln_len) {
+        int t = as->target_aln[c], q = as->query_aln[c];
+        if (t != 5 && q == 5) { // deletion run
+            hts_pos_t rb = ref_pos; int len = 0;
+            while (c < as->aln_len && as->target_aln[c] != 5 && as->query_aln[c] == 5) { len++; ref_pos++; c++; }
+            hts_pos_t re = ref_pos - 1;
+            if (len >= min_sv && len > best && rb <= gap_end && re >= gap_beg) { best = len; *sv_beg = rb; *sv_end = re; }
+        } else if (t == 5) { // insertion run
+            int len = 0;
+            while (c < as->aln_len && as->target_aln[c] == 5) { len++; c++; }
+            hts_pos_t rb = ref_pos - 1, re = ref_pos;
+            if (len >= min_sv && len > best && rb <= gap_end && re >= gap_beg) { best = len; *sv_beg = rb; *sv_end = re; }
+        } else { ref_pos++; c++; }
+    }
+    return best;
+}
+
 // local assembly rescue over an expanded window: full-length read subsequences are assembled with DeKnot,
 // the phased walks are aligned to the expanded reference, and the alignments are trimmed back to the
 // noisy region (extended over any indel run that crosses its boundary, so SVs survive intact).
@@ -2112,7 +2150,8 @@ static int deknot_align_walk(const call_var_opt_t *opt, uint8_t *ref_seq, int re
 static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
                      hts_pos_t pair_beg, hts_pos_t pair_end,
                      int n_noisy_reads, int *noisy_reads, hts_pos_t flank_len, int abort_on_edge, int *hit_window_edge, int pass,
-                     int n_cons_existing, int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs, hts_pos_t *var_reg_beg) {
+                     int n_cons_existing, int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs, hts_pos_t *var_reg_beg,
+                     hts_pos_t *sv_beg, hts_pos_t *sv_end) {
     // region whose variants are wanted: the noisy region, or the span over both breakpoints
     int paired = (pair_beg >= 0 && pair_end >= pair_beg);
     hts_pos_t reg_beg = noisy_reg_beg, reg_end = noisy_reg_end;
@@ -2140,7 +2179,12 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
     if (exp_beg < 1) exp_beg = 1;
     uint8_t *ref_seq = NULL;
     int ref_seq_len = collect_reg_ref_bseq(chunk, &exp_beg, &exp_end, &ref_seq);
-    if (ref_seq_len <= 0 || ref_seq_len > max_win) { dk_stats_count(&dk_stats.n_skip_window); free(ref_seq); return n_cons_existing; }
+    if (ref_seq_len <= 0 || ref_seq_len > max_win) {
+        dk_stats_count(&dk_stats.n_skip_window);
+        if (paired) dk_stats_count(&dk_stats.n_pair_pre_reject);
+        free(ref_seq);
+        return paired ? -1 : n_cons_existing;
+    }
 
     int n_reads = 0;
     int *read_ids = (int*)malloc(chunk->n_reads * sizeof(int));
@@ -2149,7 +2193,11 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         digar_t *d = chunk->digars + i;
         if (d->beg <= exp_end && d->end >= exp_beg) read_ids[n_reads++] = i;
     }
-    if (n_reads < opt->min_dp || n_reads > opt->max_noisy_reg_cov) { dk_stats_count(&dk_stats.n_skip_depth); free(read_ids); free(ref_seq); return -1; }
+    if (n_reads < opt->min_dp || n_reads > opt->max_noisy_reg_cov) {
+        dk_stats_count(&dk_stats.n_skip_depth);
+        if (paired) dk_stats_count(&dk_stats.n_pair_pre_reject);
+        free(read_ids); free(ref_seq); return -1;
+    }
     // assembly does not need full depth: keep every noisy-region read, subsample the rest evenly
     int subsampled = 0;
     if (n_reads > max_asm_reads) {
@@ -2306,8 +2354,48 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         free(read_strs); free(read_names); free(read_ids); free(ref_seq);
         return -1;
     }
+    // paired pass: the walks have to deliver the SV the breakpoint pair predicts, an indel of at least
+    // max(5 kb, half the breakpoint distance) whose reference span overlaps the interval between the two breakpoints
+    hts_pos_t gap_beg = 0, gap_end = 0, min_sv = 0;
+    if (paired) {
+        if (pair_beg > noisy_reg_end) { gap_beg = noisy_reg_end; gap_end = pair_beg; }
+        else { gap_beg = pair_end; gap_end = noisy_reg_beg; }
+        min_sv = (gap_end - gap_beg) / 2;
+        if (min_sv < LONGCALLD_DEKNOT_PAIR_MIN_SV) min_sv = LONGCALLD_DEKNOT_PAIR_MIN_SV;
+    }
+    hts_pos_t pred_sv_beg = -1, pred_sv_end = -1; // reference span of the predicted SV over the selected walks
+    if (aln_ok && paired) {
+        int found = 0;
+        for (int i = 0; i < rescue_n; ++i) {
+            hts_pos_t sb = -1, se = -1;
+            int len = deknot_walk_sv_span(walk_alns + i, exp_beg, gap_beg, gap_end, min_sv, &sb, &se);
+            if (LONGCALLD_VERBOSE >= 2)
+                fprintf(stderr, "DeKnotPairGate %s:%" PRIi64 "-%" PRIi64 " walk=%d predicted>=%" PRIi64 " in %" PRIi64 "-%" PRIi64 " found=%d span=%" PRIi64 "-%" PRIi64 "\n",
+                        chunk->tname, noisy_reg_beg, noisy_reg_end, i, min_sv, gap_beg, gap_end, len, sb, se);
+            if (len > 0) {
+                found = 1;
+                if (pred_sv_beg < 0 || sb < pred_sv_beg) pred_sv_beg = sb;
+                if (se > pred_sv_end) pred_sv_end = se;
+            }
+        }
+        if (!found) {
+            for (int i = 0; i < rescue_n; ++i) free(walk_alns[i].target_aln);
+            dk_stats_add_attempt(chunk, noisy_reg_beg, noisy_reg_end, exp_beg, exp_end, n_reads, n_noisy_reads, subsampled, n_walks, walks_null, demoted, sel, collapsed, asm_secs, pass, DK_OUT_PAIR_NO_SV);
+            dk_walks_free(walks);
+            for (int i = 0; i < n_reads; ++i) { free(read_strs[i]); free(read_names[i]); }
+            free(read_strs); free(read_names); free(read_ids); free(ref_seq);
+            return -1;
+        }
+    }
     if (aln_ok) {
         hts_pos_t win_beg = reg_beg - opt->noisy_reg_flank_len, win_end = reg_end + opt->noisy_reg_flank_len;
+        if (paired) {
+            // the variant window covers both breakpoints and the predicted SV with a flank long enough for the
+            // read-vs-consensus alignments to reach through the SV junction (the ordinary 10 bp flank leaves a
+            // consensus that ends a few bases past the junction, and reads then do not count as covering it)
+            win_beg = (pred_sv_beg >= 0 && pred_sv_beg < reg_beg ? pred_sv_beg : reg_beg) - LONGCALLD_DEKNOT_PAIR_TRIM_FLANK;
+            win_end = (pred_sv_end > reg_end ? pred_sv_end : reg_end) + LONGCALLD_DEKNOT_PAIR_TRIM_FLANK;
+        }
         if (win_beg < exp_beg) win_beg = exp_beg;
         if (win_end > exp_end) win_end = exp_end;
         for (int iter = 0; iter < 10; ++iter) {
@@ -2425,7 +2513,20 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         }
         if (trim_ok && rescue_n == 1 && clu_n_seqs[0] == 0) rescue_n = 0;
         if (!trim_ok) rescue_n = 0;
-        if (rescue_n == 0) outcome = DK_OUT_NO_SUPPORT;
+        // paired pass: the predicted SV has to survive trimming, collapsing and demotion in a committed walk
+        int pair_no_sv = 0;
+        if (paired && rescue_n >= 1) {
+            hts_pos_t best_sb = -1, best_se = -1; int best_len = 0;
+            for (int i = 0; i < rescue_n; ++i) {
+                hts_pos_t sb = -1, se = -1;
+                int len = deknot_walk_sv_span(LONGCALLD_REF_CONS_ALN_STR(aln_strs[i]), win_beg, gap_beg, gap_end, min_sv, &sb, &se);
+                if (len > best_len) { best_len = len; best_sb = sb; best_se = se; }
+            }
+            if (best_len == 0) { rescue_n = 0; pair_no_sv = 1; }
+            else if (sv_beg != NULL && sv_end != NULL) { *sv_beg = best_sb; *sv_end = best_se; }
+        }
+        if (pair_no_sv) outcome = DK_OUT_PAIR_NO_SV;
+        else if (rescue_n == 0) outcome = DK_OUT_NO_SUPPORT;
         else if (rescue_n <= n_cons_existing) outcome = DK_OUT_NO_GAIN;
         else outcome = (rescue_n == 2) ? DK_OUT_COMMIT2 : DK_OUT_COMMIT1;
         if (rescue_n <= n_cons_existing) rescue_n = -1;
@@ -2450,6 +2551,11 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
 #define LONGCALLD_DEKNOT_PAIR_CLUSTER 2000       // partner positions within this distance agree
 #define LONGCALLD_DEKNOT_PAIR_EXCL 2000          // the partner lies outside the noisy region +- this
 #define LONGCALLD_DEKNOT_PAIR_MIN_SA_SPAN 300    // an SA entry needs this many aligned reference bases
+#define LONGCALLD_DEKNOT_PAIR_MIN_READS 3        // reads that have to agree on the partner breakpoint
+#define LONGCALLD_DEKNOT_PAIR_STRONG_TAIL 2000   // a placed tail at least this long counts at the read-type divergence;
+#define LONGCALLD_DEKNOT_PAIR_SHORT_TAIL_DIV 0.05 // a shorter one only when it places with at most this divergence
+#define LONGCALLD_DEKNOT_PAIR_UNIQUE_MARGIN 0.05 // the runner-up placement has to be worse by this fraction of the tail
+#define LONGCALLD_DEKNOT_PAIR_UNIQUE_MIN_MARGIN 10 // (at least this many edits)
 
 // first SA entry on contig tname that lies outside [reg_beg-EXCL, reg_end+EXCL] within max_dist of it:
 // returns 1 and the entry's breakpoint (its end nearest the region)
@@ -2483,10 +2589,12 @@ static int deknot_sa_partner(const char *sa, const char *tname, hts_pos_t reg_be
 }
 
 // place a clipped tail (upper-case bases) on chunk reference [search_beg, search_end] (1-based, inclusive) by
-// semi-global edlib alignment. returns the edit distance (-1: no placement within max_ed, or an ambiguous one)
-// and the breakpoint: the tail's first reference base for a right clip, its last for a left clip
+// semi-global edlib alignment. returns the edit distance (-1: no placement within max_ed, or an ambiguous one),
+// the breakpoint (the tail's first reference base for a right clip, its last for a left clip) and in *second_ed
+// the edit distance of the best placement elsewhere in the window (-1: none within max_ed + margin)
 static int deknot_place_tail(bam_chunk_t *chunk, const char *tail, int tail_len, int right_clip,
-                             hts_pos_t search_beg, hts_pos_t search_end, int max_ed, hts_pos_t *bp) {
+                             hts_pos_t search_beg, hts_pos_t search_end, int max_ed, int margin, hts_pos_t *bp, int *second_ed) {
+    *second_ed = -1;
     if (search_beg < chunk->ref_beg) search_beg = chunk->ref_beg;
     if (search_end > chunk->ref_end) search_end = chunk->ref_end;
     if (search_end - search_beg + 1 < tail_len) return -1;
@@ -2494,31 +2602,46 @@ static int deknot_place_tail(bam_chunk_t *chunk, const char *tail, int tail_len,
     char *target = (char*)malloc(tlen);
     for (int i = 0; i < tlen; ++i) target[i] = toupper(chunk->ref_seq[search_beg + i - chunk->ref_beg]);
     EdlibAlignResult r = edlibAlign(tail, tail_len, target, tlen, edlibNewAlignConfig(max_ed, EDLIB_MODE_HW, EDLIB_TASK_LOC, NULL, 0));
-    int ed = -1;
+    int ed = -1, mask_lo = -1, mask_hi = -1;
     if (r.status == EDLIB_STATUS_OK && r.editDistance >= 0 && r.editDistance <= max_ed && r.numLocations >= 1
         && r.startLocations != NULL && r.endLocations != NULL) {
         // every equally good placement has to agree on the breakpoint
         int lo = right_clip ? r.startLocations[0] : r.endLocations[0], hi = lo;
+        mask_lo = r.startLocations[0]; mask_hi = r.endLocations[0];
         for (int k = 1; k < r.numLocations; ++k) {
             int v = right_clip ? r.startLocations[k] : r.endLocations[k];
             if (v < lo) lo = v;
             if (v > hi) hi = v;
+            if (r.startLocations[k] < mask_lo) mask_lo = r.startLocations[k];
+            if (r.endLocations[k] > mask_hi) mask_hi = r.endLocations[k];
         }
         if (hi - lo <= LONGCALLD_DEKNOT_PAIR_CLUSTER) { ed = r.editDistance; *bp = search_beg + lo; }
     }
-    edlibFreeAlignResult(r); free(target);
+    edlibFreeAlignResult(r);
+    if (ed >= 0) { // best placement elsewhere: mask the found one (plus the cluster distance) and search again
+        mask_lo -= LONGCALLD_DEKNOT_PAIR_CLUSTER; mask_hi += LONGCALLD_DEKNOT_PAIR_CLUSTER;
+        if (mask_lo < 0) mask_lo = 0;
+        if (mask_hi > tlen - 1) mask_hi = tlen - 1;
+        for (int i = mask_lo; i <= mask_hi; ++i) target[i] = 'N';
+        EdlibAlignResult r2 = edlibAlign(tail, tail_len, target, tlen, edlibNewAlignConfig(ed + margin, EDLIB_MODE_HW, EDLIB_TASK_DISTANCE, NULL, 0));
+        if (r2.status == EDLIB_STATUS_OK && r2.editDistance >= 0) *second_ed = r2.editDistance;
+        edlibFreeAlignResult(r2);
+    }
+    free(target);
     return ed;
 }
 
 // find the partner breakpoint of a noisy region from its reads with long clips at the region: the SA tag when
-// one points at the same contig within LONGCALLD_DEKNOT_PAIR_MAX_DIST, otherwise the clipped tail placed on the
-// chunk reference on either side of the region. returns the number of reads agreeing on the partner (0 or >= 2)
-// and the partner interval [pair_beg, pair_end] spanned by their breakpoints.
+// one points at the same contig within LONGCALLD_DEKNOT_PAIR_MAX_DIST (weight 2), otherwise the clipped tail placed
+// on the chunk reference on either side of the region (weight 1; the placement has to be unique within the search
+// distance by a clear margin, and a tail shorter than LONGCALLD_DEKNOT_PAIR_STRONG_TAIL only counts when it places
+// with at most LONGCALLD_DEKNOT_PAIR_SHORT_TAIL_DIV divergence). returns the number of reads agreeing on the partner
+// (0, or >= LONGCALLD_DEKNOT_PAIR_MIN_READS) and the partner interval [pair_beg, pair_end] spanned by their breakpoints.
 int deknot_find_partner(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
                         int n_noisy_reads, int *noisy_reads, hts_pos_t *pair_beg, hts_pos_t *pair_end) {
     *pair_beg = -1; *pair_end = -1;
     if (chunk->reads == NULL) return 0;
-    hts_pos_t bps[LONGCALLD_DEKNOT_PAIR_MAX_CLIP_READS]; int n_bp = 0;
+    hts_pos_t bps[LONGCALLD_DEKNOT_PAIR_MAX_CLIP_READS]; int bp_w[LONGCALLD_DEKNOT_PAIR_MAX_CLIP_READS]; int n_bp = 0;
     hts_pos_t max_dist = LONGCALLD_DEKNOT_PAIR_MAX_DIST;
     double max_div = opt->is_ont ? 0.25 : 0.10;
     for (int k = 0; k < n_noisy_reads && n_bp < LONGCALLD_DEKNOT_PAIR_MAX_CLIP_READS; ++k) {
@@ -2537,7 +2660,10 @@ int deknot_find_partner(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t
         hts_pos_t bp = -1;
         char *sa = get_aux_str_from_bam(b, "SA"); // raw aux field: type byte, then the string
         if (sa != NULL && sa[0] == 'Z' && deknot_sa_partner(sa + 1, chunk->tname, noisy_reg_beg, noisy_reg_end, max_dist, &bp)) {
-            bps[n_bp++] = bp;
+            if (LONGCALLD_VERBOSE >= 2)
+                fprintf(stderr, "DeKnotTail %s:%" PRIi64 "-%" PRIi64 " %s %s_clip=%d SA partner=%" PRIi64 "\n", chunk->tname, noisy_reg_beg, noisy_reg_end,
+                        bam_get_qname(b), right_clip ? "right" : "left", clip_len, bp);
+            bp_w[n_bp] = 2; bps[n_bp++] = bp;
             continue;
         }
         // no usable SA entry (minimap2 leaves paralogous tails unmapped or as secondary alignments): place the tail ourselves
@@ -2550,44 +2676,58 @@ int deknot_find_partner(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t
         uint8_t *bseq = bam_get_seq(b);
         for (int j = 0; j < tail_len; ++j) tail[j] = seq_nt16_str[bam_seqi(bseq, q0 + j)];
         hts_pos_t clip_pos = right_clip ? d->end : d->beg;
-        int max_ed = (int)(max_div * tail_len);
+        int max_ed = (int)((tail_len < LONGCALLD_DEKNOT_PAIR_STRONG_TAIL ? LONGCALLD_DEKNOT_PAIR_SHORT_TAIL_DIV : max_div) * tail_len);
+        int margin = (int)(LONGCALLD_DEKNOT_PAIR_UNIQUE_MARGIN * tail_len);
+        if (margin < LONGCALLD_DEKNOT_PAIR_UNIQUE_MIN_MARGIN) margin = LONGCALLD_DEKNOT_PAIR_UNIQUE_MIN_MARGIN;
         // reads are only loaded for the chunk region: search within it, on either side of the noisy region
         hts_pos_t lo = chunk->reg_beg > clip_pos - max_dist ? chunk->reg_beg : clip_pos - max_dist;
         hts_pos_t hi = chunk->reg_end < clip_pos + max_dist ? chunk->reg_end : clip_pos + max_dist;
-        hts_pos_t lbp = -1, rbp = -1;
-        int led = deknot_place_tail(chunk, tail, tail_len, right_clip, lo, noisy_reg_beg - LONGCALLD_DEKNOT_PAIR_EXCL, max_ed, &lbp);
-        int red = deknot_place_tail(chunk, tail, tail_len, right_clip, noisy_reg_end + LONGCALLD_DEKNOT_PAIR_EXCL, hi, max_ed, &rbp);
+        hts_pos_t lbp = -1, rbp = -1; int lsec = -1, rsec = -1;
+        int led = deknot_place_tail(chunk, tail, tail_len, right_clip, lo, noisy_reg_beg - LONGCALLD_DEKNOT_PAIR_EXCL, max_ed, margin, &lbp, &lsec);
+        int red = deknot_place_tail(chunk, tail, tail_len, right_clip, noisy_reg_end + LONGCALLD_DEKNOT_PAIR_EXCL, hi, max_ed, margin, &rbp, &rsec);
         free(tail);
-        if (led >= 0 && (red < 0 || led < red)) bp = lbp;
-        else if (red >= 0 && (led < 0 || red < led)) bp = rbp; // equal on both sides: ambiguous
-        if (bp >= 0) bps[n_bp++] = bp;
+        // best placement over both sides; the runner-up is the other side's best or the same side's second
+        int ed = -1, second = -1;
+        if (led >= 0 && (red < 0 || led <= red)) { ed = led; bp = lbp; second = lsec; if (red >= 0 && (second < 0 || red < second)) second = red; }
+        else if (red >= 0) { ed = red; bp = rbp; second = rsec; if (led >= 0 && (second < 0 || led < second)) second = led; }
+        int unique = (ed >= 0 && (second < 0 || second > ed + margin));
+        if (LONGCALLD_VERBOSE >= 2)
+            fprintf(stderr, "DeKnotTail %s:%" PRIi64 "-%" PRIi64 " %s %s_clip=%d tail=%d placed=%" PRIi64 " ed=%d second=%d margin=%d unique=%d\n",
+                    chunk->tname, noisy_reg_beg, noisy_reg_end, bam_get_qname(b), right_clip ? "right" : "left", clip_len, tail_len, bp, ed, second, margin, unique);
+        if (unique) { bp_w[n_bp] = 1; bps[n_bp++] = bp; }
     }
-    if (n_bp < 2) return 0;
-    for (int i = 1; i < n_bp; ++i) { // insertion sort
-        hts_pos_t v = bps[i]; int j = i;
-        while (j > 0 && bps[j-1] > v) { bps[j] = bps[j-1]; j--; }
-        bps[j] = v;
+    if (n_bp < LONGCALLD_DEKNOT_PAIR_MIN_READS) return 0;
+    for (int i = 1; i < n_bp; ++i) { // insertion sort by position
+        hts_pos_t v = bps[i]; int w = bp_w[i]; int j = i;
+        while (j > 0 && bps[j-1] > v) { bps[j] = bps[j-1]; bp_w[j] = bp_w[j-1]; j--; }
+        bps[j] = v; bp_w[j] = w;
     }
-    int best_i = 0, best_j = 0;
+    // best cluster: the heaviest (SA partners count double), then the largest
+    int best_i = -1, best_j = -1, best_w = 0;
     for (int i = 0; i < n_bp; ++i) {
-        int j = i;
-        while (j + 1 < n_bp && bps[j+1] - bps[i] <= LONGCALLD_DEKNOT_PAIR_CLUSTER) j++;
-        if (j - i > best_j - best_i) { best_i = i; best_j = j; }
+        int j = i, w = bp_w[i];
+        while (j + 1 < n_bp && bps[j+1] - bps[i] <= LONGCALLD_DEKNOT_PAIR_CLUSTER) { j++; w += bp_w[j]; }
+        if (j - i + 1 < LONGCALLD_DEKNOT_PAIR_MIN_READS) continue;
+        if (w > best_w || (w == best_w && j - i > best_j - best_i)) { best_i = i; best_j = j; best_w = w; }
     }
-    if (best_j - best_i + 1 < 2) return 0;
+    if (best_i < 0) return 0;
     *pair_beg = bps[best_i]; *pair_end = bps[best_j];
+    dk_stats_count(&dk_stats.n_pair_regions);
     return best_j - best_i + 1;
 }
 
 // local-assembly rescue over one window covering the noisy region and its partner breakpoint [pair_beg, pair_end]
-// (reads: both breakpoint regions' reads). returns the committed consensus count, or -1
+// (reads: both breakpoint regions' reads). returns the committed consensus count, or -1; on a commit the walks carry
+// the SV the pair predicts and [sv_beg, sv_end] is its reference span
 int deknot_sv_rescue_paired(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
                             hts_pos_t pair_beg, hts_pos_t pair_end, int n_noisy_reads, int *noisy_reads,
-                            int n_cons_existing, int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs, hts_pos_t *var_reg_beg) {
+                            int n_cons_existing, int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs, hts_pos_t *var_reg_beg,
+                            hts_pos_t *sv_beg, hts_pos_t *sv_end) {
     int hit_edge = 0;
+    *sv_beg = -1; *sv_end = -1;
     int ret = deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, pair_beg, pair_end, n_noisy_reads, noisy_reads,
                                     LONGCALLD_DEKNOT_PAIR_FLANK_LEN, 0, &hit_edge, DK_PASS_PAIRED,
-                                    n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg);
+                                    n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg, sv_beg, sv_end);
     dk_stats_add_region(n_cons_existing, ret);
     return ret;
 }
@@ -2611,18 +2751,18 @@ int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t no
     if (n_long_clip >= 2) {
         ret = deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, -1, -1, n_noisy_reads, noisy_reads,
                                     LONGCALLD_DEKNOT_FLANK_LEN, 0, &hit_edge, DK_PASS_WIDE,
-                                    n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg);
+                                    n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg, NULL, NULL);
         dk_stats_add_region(n_cons_existing, ret);
         return ret;
     }
     ret = deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, -1, -1, n_noisy_reads, noisy_reads,
                                 LONGCALLD_DEKNOT_SMALL_FLANK_LEN, 1, &hit_edge, DK_PASS_SMALL,
-                                n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg);
+                                n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg, NULL, NULL);
     // an indel run crossing the small window's edge means an SV larger than the flank: retry wide
     if (ret < 0 && hit_edge) {
         ret = deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, -1, -1, n_noisy_reads, noisy_reads,
                                     LONGCALLD_DEKNOT_FLANK_LEN, 0, &hit_edge, DK_PASS_WIDE_RETRY,
-                                    n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg);
+                                    n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg, NULL, NULL);
     }
     dk_stats_add_region(n_cons_existing, ret);
     return ret;

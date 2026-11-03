@@ -2142,7 +2142,13 @@ int get_full_cover_from_ref_cons_aln_str(aln_str_t *cons_aln_str, aln_str_t *ref
             break;
         }
     }
-
+    // a deletion longer than a read can span (local-assembly SVs): the read covers it when its alignment runs
+    // through either breakpoint with LONGCALLD_LARGE_DEL_COVER_FLANK consensus bases on both sides
+    if (end_in_ref - beg_in_ref + 1 > LONGCALLD_LARGE_DEL_COVER_LEN && beg_in_cons >= 0 && end_in_cons >= 0) {
+        int f = LONGCALLD_LARGE_DEL_COVER_FLANK;
+        int lb = beg_in_cons - f < 0 ? 0 : beg_in_cons - f, rb = end_in_cons - f < 0 ? 0 : end_in_cons - f;
+        return is_cover_aln_str(cons_aln_str, lb, beg_in_cons + f - lb + 1) || is_cover_aln_str(cons_aln_str, rb, end_in_cons + f - rb + 1);
+    }
     return is_cover_aln_str(cons_aln_str, beg_in_cons, end_in_cons-beg_in_cons+1);
 }
 
@@ -2667,7 +2673,8 @@ int deknot_find_partner(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t
                         int n_noisy_reads, int *noisy_reads, hts_pos_t *pair_beg, hts_pos_t *pair_end);
 int deknot_sv_rescue_paired(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
                             hts_pos_t pair_beg, hts_pos_t pair_end, int n_noisy_reads, int *noisy_reads,
-                            int n_cons_existing, int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs, hts_pos_t *var_reg_beg);
+                            int n_cons_existing, int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs, hts_pos_t *var_reg_beg,
+                            hts_pos_t *sv_beg, hts_pos_t *sv_end);
 
 static int deknot_rescue_enabled(const call_var_opt_t *opt) {
     return opt->use_deknot && !opt->out_somatic && !(opt->refine_bam && opt->out_aln_fp != NULL);
@@ -2760,29 +2767,36 @@ int collect_noisy_vars1(bam_chunk_t *chunk, const call_var_opt_t *opt, int noisy
             p_aln_strs[i] = (aln_str_t*)malloc((1 + n_all * 2) * sizeof(aln_str_t));
             for (int j = 0; j < 1+n_all*2; ++j) { p_aln_strs[i][j].target_aln = NULL; p_aln_strs[i][j].query_aln = NULL; p_aln_strs[i][j].aln_len = 0; }
         }
+        hts_pos_t sv_beg = -1, sv_end = -1;
         int rescue_n_cons = deknot_sv_rescue_paired(opt, chunk, noisy_reg_beg, noisy_reg_end, pb, pe, n_all, all_reads,
-                                                    0, p_clu_n_seqs, p_clu_read_ids, p_aln_strs, &var_reg_beg);
+                                                    0, p_clu_n_seqs, p_clu_read_ids, p_aln_strs, &var_reg_beg, &sv_beg, &sv_end);
         if (rescue_n_cons >= 1) {
             if (LONGCALLD_VERBOSE >= 1)
-                fprintf(stderr, "DeKnotPaired %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " partner %" PRIi64 "-%" PRIi64 " %d reads n_cons: %d clu: %d,%d\n",
-                        chunk->tname, noisy_reg_beg, noisy_reg_end, noisy_reg_end-noisy_reg_beg+1, pb, pe, n_all, rescue_n_cons, p_clu_n_seqs[0], p_clu_n_seqs[1]);
+                fprintf(stderr, "DeKnotPaired %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " partner %" PRIi64 "-%" PRIi64 " %d reads n_cons: %d clu: %d,%d sv=%" PRIi64 "-%" PRIi64 "\n",
+                        chunk->tname, noisy_reg_beg, noisy_reg_end, noisy_reg_end-noisy_reg_beg+1, pb, pe, n_all, rescue_n_cons, p_clu_n_seqs[0], p_clu_n_seqs[1], sv_beg, sv_end);
             // the paired result replaces this region's read set and slots; the partner region is covered by it
             for (int i = 0; i < 2; ++i) free(aln_strs[i]);
             free(aln_strs); free(clu_n_seqs); free(clu_read_ids); free(noisy_reads);
             aln_strs = p_aln_strs; clu_n_seqs = p_clu_n_seqs; clu_read_ids = p_clu_read_ids;
             noisy_reads = all_reads; n_noisy_reads = n_all;
             n_cons = rescue_n_cons; paired = 1;
-            // the partner region was called by this window: do not call it again on its own from reads that are
-            // mis-aligned across the SV. with both haplotypes committed, the same holds for every noisy region
-            // inside the SV span; with one, the other haplotype's regions inside the span are still called on their own
-            if (noisy_reg_is_done != NULL) {
-                hts_pos_t span_beg = pb < noisy_reg_beg ? pb : noisy_reg_beg, span_end = pe > noisy_reg_end ? pe : noisy_reg_end;
+            // the committed walks carry the predicted SV: noisy regions lying inside its reference span (at least
+            // LONGCALLD_DEKNOT_PAIR_INSIDE_FRAC of the region, since the SV placement is ambiguous by a repeat unit)
+            // were called by this window and are not called again on their own from reads mis-aligned across the SV
+            if (noisy_reg_is_done != NULL && sv_beg >= 0 && sv_end > sv_beg) {
                 cgranges_t *regs = chunk->chunk_noisy_regs;
                 for (int j = 0; j < regs->n_r; ++j) {
                     if (j == noisy_reg_i || noisy_reg_is_done[j]) continue;
-                    if (j == pair_reg[noisy_reg_i] || (rescue_n_cons == 2 && cr_start(regs, j) >= span_beg && cr_end(regs, j) <= span_end)) {
+                    hts_pos_t rb = cr_start(regs, j), re = cr_end(regs, j);
+                    hts_pos_t ob = rb > sv_beg ? rb : sv_beg, oe = re < sv_end ? re : sv_end;
+                    int inside = (oe >= ob && (double)(oe - ob + 1) >= LONGCALLD_DEKNOT_PAIR_INSIDE_FRAC * (double)(re - rb + 1));
+                    // the other breakpoint region of this same SV: its own partner lies inside the committed SV and it
+                    // touches the SV itself; re-assembling it would only commit the same SV again
+                    int same_pair = (pair_beg[j] >= 0 && pair_beg[j] >= sv_beg - 2000 && pair_end[j] <= sv_end + 2000
+                                     && re >= sv_beg - 2000 && rb <= sv_end + 2000);
+                    if (inside || same_pair) {
                         noisy_reg_is_done[j] = 1;
-                        if (LONGCALLD_VERBOSE >= 1) fprintf(stderr, "DeKnotPairedSkip %s:%d-%d inside %" PRIi64 "-%" PRIi64 "\n", chunk->tname, cr_start(regs, j), cr_end(regs, j), span_beg, span_end);
+                        if (LONGCALLD_VERBOSE >= 1) fprintf(stderr, "DeKnotPairedSkip %s:%d-%d %s SV %" PRIi64 "-%" PRIi64 "\n", chunk->tname, cr_start(regs, j), cr_end(regs, j), inside ? "inside" : "other breakpoint of", sv_beg, sv_end);
                     }
                 }
             }
