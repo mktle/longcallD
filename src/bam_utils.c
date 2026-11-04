@@ -1343,6 +1343,8 @@ int bam_chunk_init0(bam_chunk_t *chunk, const struct call_var_opt_t *opt, int n_
         chunk->down_ovlp_read_i[i] = (int*)malloc(n_reads * sizeof(int));
     }
     chunk->reads = (bam1_t**)malloc(n_reads * sizeof(bam1_t*));
+    chunk->all_depth = NULL; chunk->n_all_depth = 0; chunk->hq_depth = NULL;
+    chunk->lowmq_reads = NULL; chunk->n_lowmq_reads = 0; chunk->m_lowmq_reads = 0;
     chunk->ref_seq = NULL;
     chunk->low_comp_cr = NULL;
     // intermediate
@@ -1441,6 +1443,12 @@ static void bam_chunk_clear_var_noisy_read_cache(bam_chunk_t *chunk) {
 
 void bam_chunk_free(bam_chunk_t *chunk) {
     free(chunk->qual_counts);
+    if (chunk->all_depth != NULL) { free(chunk->all_depth); chunk->all_depth = NULL; }
+    if (chunk->hq_depth != NULL) { free(chunk->hq_depth); chunk->hq_depth = NULL; }
+    if (chunk->lowmq_reads != NULL) {
+        for (int i = 0; i < chunk->n_lowmq_reads; ++i) bam_destroy1(chunk->lowmq_reads[i]);
+        free(chunk->lowmq_reads); chunk->lowmq_reads = NULL; chunk->n_lowmq_reads = chunk->m_lowmq_reads = 0;
+    }
     if (chunk->ref_seq != NULL) free(chunk->ref_seq);
     if (chunk->low_comp_cr != NULL) cr_destroy(chunk->low_comp_cr);
     bam_chunk_clear_var_noisy_read_cache(chunk);
@@ -1494,6 +1502,12 @@ void bam_chunk_free_digar(bam_chunk_t *chunk) {
 
 void bam_chunk_post_free(bam_chunk_t *chunk, const struct call_var_opt_t *opt) {
     free(chunk->qual_counts);
+    if (chunk->all_depth != NULL) { free(chunk->all_depth); chunk->all_depth = NULL; }
+    if (chunk->hq_depth != NULL) { free(chunk->hq_depth); chunk->hq_depth = NULL; }
+    if (chunk->lowmq_reads != NULL) {
+        for (int i = 0; i < chunk->n_lowmq_reads; ++i) bam_destroy1(chunk->lowmq_reads[i]);
+        free(chunk->lowmq_reads); chunk->lowmq_reads = NULL; chunk->n_lowmq_reads = chunk->m_lowmq_reads = 0;
+    }
     if (chunk->ref_seq != NULL) free(chunk->ref_seq);
     if (chunk->cand_vars != NULL) free_cand_vars(chunk->cand_vars, chunk->n_cand_vars);
     if (chunk->var_i_to_cate != NULL) free(chunk->var_i_to_cate);
@@ -1655,6 +1669,17 @@ void sort_chunk_reads(bam_chunk_t *chunk) {
     free(read_sorts);
 }
 
+static void bam_chunk_add_all_depth(bam_chunk_t *chunk, bam1_t *b) {
+    if (chunk->all_depth == NULL) return;
+    hts_pos_t beg = b->core.pos + 1, end = bam_endpos(b);
+    if (end < chunk->reg_beg || beg > chunk->reg_end) return;
+    if (beg < chunk->reg_beg) beg = chunk->reg_beg;
+    if (end > chunk->reg_end) end = chunk->reg_end;
+    int b0 = (int)((beg - chunk->reg_beg) / LONGCALLD_DEPTH_BIN), b1 = (int)((end - chunk->reg_beg) / LONGCALLD_DEPTH_BIN);
+    int hq = (chunk->hq_depth != NULL && b->core.qual >= LONGCALLD_DEKNOT_UNIQUE_MQ);
+    for (int i = b0; i <= b1 && i < chunk->n_all_depth; ++i) { chunk->all_depth[i]++; if (hq) chunk->hq_depth[i]++; }
+}
+
 // load ref_seq/read in reg_chunks[reg_chunk_i]->tid/beg/end[reg_i] to chunks
 int collect_ref_seq_bam_main(const struct call_var_pl_t *pl, struct call_var_io_aux_t *io_aux, int reg_chunk_i, int reg_i, bam_chunk_t *chunk) {
     assert(reg_chunk_i < pl->n_reg_chunks); assert(reg_i < pl->reg_chunks[reg_chunk_i].n_regions);
@@ -1667,6 +1692,11 @@ int collect_ref_seq_bam_main(const struct call_var_pl_t *pl, struct call_var_io_
     bam_chunk_init0(chunk, opt, 4096, io_aux->n_bam);
     chunk->reg_chunk_i = reg_chunk_i; chunk->reg_i = reg_i;
     chunk->tid = tid; chunk->tname = io_aux->headers[0]->target_name[tid]; chunk->reg_beg = reg_beg; chunk->reg_end = reg_end;
+    if (opt->use_deknot) {
+        chunk->n_all_depth = (int)((reg_end - reg_beg) / LONGCALLD_DEPTH_BIN) + 1;
+        chunk->all_depth = (int32_t*)calloc(chunk->n_all_depth, sizeof(int32_t));
+        chunk->hq_depth = (int32_t*)calloc(chunk->n_all_depth, sizeof(int32_t));
+    }
     hts_pos_t min_read_beg = reg_beg, max_read_end = reg_end;
     for (int i = 0; i < io_aux->n_bam; ++i) {
         // create iterator for the region
@@ -1680,6 +1710,16 @@ int collect_ref_seq_bam_main(const struct call_var_pl_t *pl, struct call_var_io_
         // fprintf(stderr, "Loading reads from region %s:%" PRId64 "-%" PRId64 "\n", io_aux->headers[i]->target_name[tid], reg_beg, reg_end);
         while (sam_itr_next(in_bam, iter, chunk->reads[chunk->n_reads]) >= 0) {
             // fprintf(stderr, "load read %s\n", bam_get_qname(chunk->reads[chunk->n_reads]));
+            if (!(chunk->reads[chunk->n_reads]->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY)))
+                bam_chunk_add_all_depth(chunk, chunk->reads[chunk->n_reads]);
+            if (opt->use_deknot && !(chunk->reads[chunk->n_reads]->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY))
+                && chunk->reads[chunk->n_reads]->core.qual < min_mapq) {
+                if (chunk->n_lowmq_reads == chunk->m_lowmq_reads) {
+                    chunk->m_lowmq_reads = chunk->m_lowmq_reads ? 2 * chunk->m_lowmq_reads : 64;
+                    chunk->lowmq_reads = (bam1_t**)realloc(chunk->lowmq_reads, chunk->m_lowmq_reads * sizeof(bam1_t*));
+                }
+                chunk->lowmq_reads[chunk->n_lowmq_reads++] = bam_dup1(chunk->reads[chunk->n_reads]);
+            }
             if (chunk->reads[chunk->n_reads]->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY) || chunk->reads[chunk->n_reads]->core.qual < min_mapq) {
                 if (is_ovlp_with_prev_region(pl, chunk, chunk->reads[chunk->n_reads])) chunk->n_up_ovlp_skip_reads[i]++;
                 if (is_ovlp_with_next_region(pl, chunk, chunk->reads[chunk->n_reads])) chunk->n_down_ovlp_skip_reads[i]++;

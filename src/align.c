@@ -17,6 +17,7 @@
 #include <pthread.h>
 #include <inttypes.h>
 #include <ctype.h>
+#include <limits.h>
 
 extern int LONGCALLD_VERBOSE;
 
@@ -34,12 +35,13 @@ enum {
     DK_OUT_HIT_EDGE,    // an indel run crossed the small window edge (retried with the wide flank)
     DK_OUT_NO_SUPPORT,  // trimmed walks had no supporting noisy-region reads
     DK_OUT_PAIR_NO_SV,  // paired pass: no walk carries the SV the breakpoint pair predicts
+    DK_OUT_PAIR_NO_JUNC,
     DK_OUT_N
 };
-static const char *dk_out_names[DK_OUT_N] = {"commit_1cons", "commit_2cons", "no_walks", "gt2_walks_none_span", "no_gain", "poor_aln", "hit_edge", "no_read_support", "paired_no_predicted_sv"};
+static const char *dk_out_names[DK_OUT_N] = {"commit_1cons", "commit_2cons", "no_walks", "gt2_walks_none_span", "no_gain", "poor_aln", "hit_edge", "no_read_support", "paired_no_predicted_sv", "paired_no_junction_support"};
 // which pass of deknot_sv_rescue invoked the assembler
-enum { DK_PASS_SMALL = 0, DK_PASS_WIDE, DK_PASS_WIDE_RETRY, DK_PASS_PAIRED, DK_PASS_N };
-static const char *dk_pass_names[DK_PASS_N] = {"small_flank", "wide_flank", "wide_retry", "paired"};
+enum { DK_PASS_SMALL = 0, DK_PASS_WIDE, DK_PASS_WIDE_RETRY, DK_PASS_PAIRED, DK_PASS_DEPTH, DK_PASS_N };
+static const char *dk_pass_names[DK_PASS_N] = {"small_flank", "wide_flank", "wide_retry", "paired", "depth"};
 // how a result with more than two walks was reduced to at most two
 enum { DK_SEL_NONE = 0, DK_SEL_PAIR, DK_SEL_SINGLE, DK_SEL_N };
 static const char *dk_sel_names[DK_SEL_N] = {"none", "pair", "single"};
@@ -71,6 +73,9 @@ typedef struct {
     // paired-breakpoint pass: regions with a partner, attempts that reached the assembler, commits carrying the
     // predicted SV, attempts rejected by the SV gate, attempts rejected before assembly (window/depth)
     int64_t n_pair_regions, n_pair_asm, n_pair_commit_sv, n_pair_gate_reject, n_pair_pre_reject;
+    int64_t n_depth_runs, n_depth_asm, n_depth_commit_sv, n_depth_gate_reject;
+    int64_t n_pair_junc_reject, n_depth_junc_reject;
+    int64_t n_wfa_capped;
     double outcome_time_sum[DK_OUT_N];  // wall seconds inside dk_assemble_walks, per outcome
     int64_t outcome_reads_sum[DK_OUT_N]; // reads given to the assembler, per outcome
     int64_t reg_len_sum, reg_len_min, reg_len_max; // noisy region length (bp)
@@ -104,6 +109,7 @@ static void dk_stats_add_region(int n_cons_existing, int ret) {
 // record one assembly attempt and, in verbose mode, print its per-region line
 // walks_null: dk_assemble_walks returned NULL; demoted: a two-walk result was dropped to one consensus
 // sel: what the >2-walk selection kept; collapsed: a near-identical walk pair was reduced to one consensus
+static double dk_aln_secs = 0.0, dk_read_secs = 0.0;
 static void dk_stats_add_attempt(const bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
                                  hts_pos_t exp_beg, hts_pos_t exp_end, int n_reads, int n_noisy_reads, int subsampled,
                                  int n_walks, int walks_null, int demoted, int sel, int collapsed, double secs, int pass, int outcome) {
@@ -126,6 +132,12 @@ static void dk_stats_add_attempt(const bam_chunk_t *chunk, hts_pos_t noisy_reg_b
         dk_stats.n_pair_asm++;
         if (outcome == DK_OUT_COMMIT1 || outcome == DK_OUT_COMMIT2) dk_stats.n_pair_commit_sv++;
         else if (outcome == DK_OUT_PAIR_NO_SV) dk_stats.n_pair_gate_reject++;
+        else if (outcome == DK_OUT_PAIR_NO_JUNC) dk_stats.n_pair_junc_reject++;
+    } else if (pass == DK_PASS_DEPTH) {
+        dk_stats.n_depth_asm++;
+        if (outcome == DK_OUT_COMMIT1 || outcome == DK_OUT_COMMIT2) dk_stats.n_depth_commit_sv++;
+        else if (outcome == DK_OUT_PAIR_NO_SV) dk_stats.n_depth_gate_reject++;
+        else if (outcome == DK_OUT_PAIR_NO_JUNC) dk_stats.n_depth_junc_reject++;
     }
     dk_stats.outcome_time_sum[outcome] += secs;
     dk_stats.outcome_reads_sum[outcome] += n_reads;
@@ -136,11 +148,12 @@ static void dk_stats_add_attempt(const bam_chunk_t *chunk, hts_pos_t noisy_reg_b
     if (secs > dk_stats.asm_time_max) dk_stats.asm_time_max = secs;
     pthread_mutex_unlock(&dk_stats.lock);
     if (LONGCALLD_VERBOSE >= 1)
-        fprintf(stderr, "DeKnotAsm %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " pass=%s win=%" PRIi64 "-%" PRIi64 " (%" PRIi64 ") reads=%d%s noisy_reads=%d walks=%d%s%s%s%s%s time=%.2fs outcome=%s\n",
+        fprintf(stderr, "DeKnotAsm %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " pass=%s win=%" PRIi64 "-%" PRIi64 " (%" PRIi64 ") reads=%d%s noisy_reads=%d walks=%d%s%s%s%s%s time=%.2fs aln=%.2fs reads_aln=%.2fs outcome=%s\n",
                 chunk->tname, noisy_reg_beg, noisy_reg_end, reg_len, dk_pass_names[pass], exp_beg, exp_end, win_len,
                 n_reads, subsampled ? "(subsampled)" : "", n_noisy_reads, n_walks, (n_walks == 0 && walks_null) ? "(null)" : "",
                 demoted ? " demoted" : "", sel != DK_SEL_NONE ? " sel=" : "", sel != DK_SEL_NONE ? dk_sel_names[sel] : "",
-                collapsed ? " collapsed" : "", secs, dk_out_names[outcome]);
+                collapsed ? " collapsed" : "", secs, dk_aln_secs, dk_read_secs, dk_out_names[outcome]);
+    dk_aln_secs = 0.0; dk_read_secs = 0.0;
 }
 
 #undef DK_STATS_MINMAX
@@ -153,10 +166,12 @@ void deknot_print_stats(void) {
             s->n_regions, s->n_regions_cons0, s->n_regions_cons1, s->n_regions_rescued);
     fprintf(stderr, "  skipped before assembly:  no breakpoint signature: %" PRIi64 ", window empty/too long: %" PRIi64 ", depth out of range: %" PRIi64 "\n",
             s->n_skip_no_breakpoint, s->n_skip_window, s->n_skip_depth);
-    fprintf(stderr, "  assembly attempts:        %" PRIi64 " (small flank: %" PRIi64 ", wide flank: %" PRIi64 ", wide retry: %" PRIi64 ", paired breakpoints: %" PRIi64 "), read set subsampled: %" PRIi64 "\n",
-            s->n_asm, s->n_asm_pass[DK_PASS_SMALL], s->n_asm_pass[DK_PASS_WIDE], s->n_asm_pass[DK_PASS_WIDE_RETRY], s->n_asm_pass[DK_PASS_PAIRED], s->n_asm_subsampled);
-    fprintf(stderr, "  paired breakpoints:       regions paired: %" PRIi64 ", attempts: %" PRIi64 ", committed with predicted SV: %" PRIi64 ", rejected by SV gate: %" PRIi64 ", rejected before assembly: %" PRIi64 "\n",
-            s->n_pair_regions, s->n_pair_asm, s->n_pair_commit_sv, s->n_pair_gate_reject, s->n_pair_pre_reject);
+    fprintf(stderr, "  assembly attempts:        %" PRIi64 " (small flank: %" PRIi64 ", wide flank: %" PRIi64 ", wide retry: %" PRIi64 ", paired breakpoints: %" PRIi64 ", depth-triggered: %" PRIi64 "), read set subsampled: %" PRIi64 "\n",
+            s->n_asm, s->n_asm_pass[DK_PASS_SMALL], s->n_asm_pass[DK_PASS_WIDE], s->n_asm_pass[DK_PASS_WIDE_RETRY], s->n_asm_pass[DK_PASS_PAIRED], s->n_asm_pass[DK_PASS_DEPTH], s->n_asm_subsampled);
+    fprintf(stderr, "  paired breakpoints:       regions paired: %" PRIi64 ", attempts: %" PRIi64 ", committed with predicted SV: %" PRIi64 ", rejected by SV gate: %" PRIi64 ", rejected by junction gate: %" PRIi64 ", rejected before assembly: %" PRIi64 "; depth-triggered: runs: %" PRIi64 ", attempts: %" PRIi64 ", committed: %" PRIi64 ", rejected by SV gate: %" PRIi64 ", rejected by junction gate: %" PRIi64 "\n",
+            s->n_pair_regions, s->n_pair_asm, s->n_pair_commit_sv, s->n_pair_gate_reject, s->n_pair_junc_reject, s->n_pair_pre_reject,
+            s->n_depth_runs, s->n_depth_asm, s->n_depth_commit_sv, s->n_depth_gate_reject, s->n_depth_junc_reject);
+    fprintf(stderr, "  paired-pass walks stopped at the WFA score cap: %" PRIi64 "\n", s->n_wfa_capped);
     if (s->n_asm > 0) {
         double n = (double)s->n_asm;
         fprintf(stderr, "  noisy region length:      min %" PRIi64 ", mean %.0f, max %" PRIi64 " bp\n", s->reg_len_min, s->reg_len_sum / n, s->reg_len_max);
@@ -567,6 +582,8 @@ int wfa_heuristic_aln(uint8_t *pattern, int plen, uint8_t *text, int tlen,
 // cons vs ref: ultra-low mem + dual-gap + no heuristic to ensure accurate alignment
 // full read/cons vs full read: ultra-low mem + affine-gap + wf-adaptive to ensure accurate alignment and speed up
 // full read/cons vs partial read: high mem (default) + affine-gap + heuristic (xdrop/zdrop) to speed up
+static __thread int wfa_max_steps = INT_MAX;
+static __thread int wfa_last_capped = 0;
 int wfa_end2end_aln_mem(int mem_ultralow, int pattern_ends_free, uint8_t *pattern, int plen, uint8_t *text, int tlen,
                     int gap_aln, int b, int q, int e, int q2, int e2, int heuristic, int affine_gap, // heuristic: 0: no, 1: default, 2: zdrop
                     uint32_t **cigar_buf, int *cigar_length, uint8_t **pattern_alg, uint8_t **text_alg, int *alg_length) {
@@ -616,7 +633,20 @@ int wfa_end2end_aln_mem(int mem_ultralow, int pattern_ends_free, uint8_t *patter
     }
 
     // Align
-    wavefront_align(wf_aligner, (const char*)p, plen, (const char*)t, tlen);
+    wfa_last_capped = 0;
+    if (wfa_max_steps != INT_MAX) wavefront_aligner_set_max_alignment_steps(wf_aligner, wfa_max_steps);
+    int wf_status = wavefront_align(wf_aligner, (const char*)p, plen, (const char*)t, tlen);
+    if (wf_status != WF_STATUS_ALG_COMPLETED && wf_status != WF_STATUS_ALG_PARTIAL) {
+        wfa_last_capped = (wf_status == WF_STATUS_MAX_STEPS_REACHED);
+        if (cigar_length != NULL) *cigar_length = 0;
+        if (cigar_buf != NULL) *cigar_buf = NULL;
+        if (alg_length != NULL) *alg_length = 0;
+        if (pattern_alg != NULL) *pattern_alg = NULL;
+        if (text_alg != NULL) *text_alg = NULL;
+        wavefront_aligner_delete(wf_aligner);
+        if (gap_aln == LONGCALLD_GAP_LEFT_ALN) { free(p); free(t); }
+        return -1;
+    }
     cigar_t *cigar = wf_aligner->cigar;
     if (LONGCALLD_VERBOSE >= 3 && cigar != NULL && cigar->cigar_length > 0) {
         char *p_seq = (char*)malloc(plen+1); char *t_seq = (char*)malloc(tlen+1);
@@ -2062,11 +2092,40 @@ static uint8_t *deknot_aln_sub_query(aln_str_t *as, int beg, int end, int *len) 
     return s;
 }
 
+#define LONGCALLD_DEKNOT_PAIR_EDGE_GAP 1000
+
+static int deknot_aln_edge_gap(aln_str_t *as, int min_len, int edge) {
+    int c = 0;
+    while (c < as->aln_len) {
+        int t = as->target_aln[c], q = as->query_aln[c];
+        int kind = (t == 5) ? 1 : (q == 5) ? 2 : 0;
+        if (kind == 0) { c++; continue; }
+        int beg = c;
+        while (c < as->aln_len && ((kind == 1 && as->target_aln[c] == 5) || (kind == 2 && as->query_aln[c] == 5 && as->target_aln[c] != 5))) c++;
+        int len = c - beg;
+        if (len >= min_len && (beg < edge || as->aln_len - c < edge)) return 1;
+    }
+    return 0;
+}
+
+static hts_pos_t deknot_aln_net_change(aln_str_t *as, int beg, int end) {
+    hts_pos_t del = 0, ins = 0; int ref_pos = 0;
+    for (int c = 0; c < as->aln_len; ++c) {
+        int t = as->target_aln[c], q = as->query_aln[c];
+        if (t != 5) {
+            if (ref_pos > end) break;
+            if (ref_pos >= beg && q == 5) del++;
+            ref_pos++;
+        } else if (ref_pos > beg && ref_pos <= end) ins++;
+    }
+    return del - ins;
+}
+
 // orient and align one DeKnot walk end-to-end to the expanded reference. returns 0 (and an empty *as) when the walk
 // aligns poorly in both orientations. on success fills *as, the ref offsets [ref_beg, ref_end] of its aligned bases
 // and a score (matches minus mismatches minus gap runs, so an SV allele costs one)
 static int deknot_align_walk(const call_var_opt_t *opt, uint8_t *ref_seq, int ref_seq_len, const char *walk, aln_str_t *as,
-                             int *ref_beg, int *ref_end, int *score) {
+                             int *ref_beg, int *ref_end, int *score, double cap_div, int *capped) {
     as->target_aln = NULL; as->query_aln = NULL; as->aln_len = 0;
     *ref_beg = -1; *ref_end = -1; *score = 0;
     int wlen = strlen(walk);
@@ -2084,9 +2143,18 @@ static int deknot_align_walk(const call_var_opt_t *opt, uint8_t *ref_seq, int re
     int best_eq = (rev_eq > fwd_eq) ? rev_eq : fwd_eq;
     int min_len = (wlen < ref_seq_len) ? wlen : ref_seq_len;
     if (best_eq < (int)(0.55 * min_len)) { free(wseq); free(wseq_rc); return 0; }
+    if (capped != NULL) *capped = 0;
+    if (cap_div > 0) {
+        long long d = wlen > ref_seq_len ? wlen - ref_seq_len : ref_seq_len - wlen;
+        long long g1 = opt->gap_open1 + (long long)opt->gap_ext1 * d, g2 = opt->gap_open2 + (long long)opt->gap_ext2 * d;
+        long long budget = (d > 0 ? (g1 < g2 ? g1 : g2) : 0) + (long long)(cap_div * min_len * opt->mismatch) + 1000;
+        wfa_max_steps = budget < INT_MAX ? (int)budget : INT_MAX;
+    }
     wfa_end2end_aln_mem(1, 0, ref_seq, ref_seq_len, use_seq, wlen, opt->gap_aln, opt->mismatch, opt->gap_open1, opt->gap_ext1, opt->gap_open2, opt->gap_ext2,
                         LONGCALLD_WFA_NO_HEURISTIC, LONGCALLD_WFA_AFFINE_2P,
                         NULL, NULL, &as->target_aln, &as->query_aln, &as->aln_len);
+    wfa_max_steps = INT_MAX;
+    if (capped != NULL) *capped = wfa_last_capped;
     free(wseq); free(wseq_rc);
     if (as->aln_len <= 0) {
         if (as->target_aln != NULL) free(as->target_aln);
@@ -2112,30 +2180,185 @@ static int deknot_align_walk(const call_var_opt_t *opt, uint8_t *ref_seq, int re
 }
 
 #define LONGCALLD_DEKNOT_PAIR_MIN_SV 5000 // a breakpoint pair predicts an indel of at least this, or half the breakpoint distance
-#define LONGCALLD_DEKNOT_PAIR_TRIM_FLANK 500 // variant window flank around the breakpoints and the predicted SV in the paired pass
+#define LONGCALLD_DEKNOT_PAIR_WFA_CAP_DIV 0.02
 
 // longest indel run of at least min_sv bp in a walk-vs-ref alignment (ref coordinate of column 0: aln_ref_beg) whose
 // reference span overlaps [gap_beg, gap_end]; returns its length (0: none) and span (a deletion: the deleted
 // reference bases; an insertion: the two reference bases around it)
-static int deknot_walk_sv_span(aln_str_t *as, hts_pos_t aln_ref_beg, hts_pos_t gap_beg, hts_pos_t gap_end, hts_pos_t min_sv,
-                               hts_pos_t *sv_beg, hts_pos_t *sv_end) {
+#define LONGCALLD_DEKNOT_PAIR_SV_ANCHOR 200
+static int deknot_walk_sv_span2(aln_str_t *as, hts_pos_t aln_ref_beg, hts_pos_t gap_beg, hts_pos_t gap_end, hts_pos_t min_sv,
+                                hts_pos_t *sv_beg, hts_pos_t *sv_end, int *q_at) {
     hts_pos_t ref_pos = aln_ref_beg; // reference position of the next reference base
-    int best = 0, c = 0;
+    int best = 0, c = 0, qpos = 0;
+    int n_aligned = 0, aligned_before = 0;
+    for (int k = 0; k < as->aln_len; ++k) if (as->target_aln[k] != 5 && as->query_aln[k] != 5) n_aligned++;
     while (c < as->aln_len) {
         int t = as->target_aln[c], q = as->query_aln[c];
         if (t != 5 && q == 5) { // deletion run
-            hts_pos_t rb = ref_pos; int len = 0;
+            hts_pos_t rb = ref_pos; int len = 0, q0 = qpos;
             while (c < as->aln_len && as->target_aln[c] != 5 && as->query_aln[c] == 5) { len++; ref_pos++; c++; }
             hts_pos_t re = ref_pos - 1;
-            if (len >= min_sv && len > best && rb <= gap_end && re >= gap_beg) { best = len; *sv_beg = rb; *sv_end = re; }
+            int anchored = (aligned_before >= LONGCALLD_DEKNOT_PAIR_SV_ANCHOR && n_aligned - aligned_before >= LONGCALLD_DEKNOT_PAIR_SV_ANCHOR);
+            if (anchored && len >= min_sv && len > best && rb <= gap_end && re >= gap_beg) { best = len; *sv_beg = rb; *sv_end = re; if (q_at) *q_at = q0; }
         } else if (t == 5) { // insertion run
-            int len = 0;
-            while (c < as->aln_len && as->target_aln[c] == 5) { len++; c++; }
+            int len = 0, q0 = qpos;
+            while (c < as->aln_len && as->target_aln[c] == 5) { len++; qpos++; c++; }
             hts_pos_t rb = ref_pos - 1, re = ref_pos;
-            if (len >= min_sv && len > best && rb <= gap_end && re >= gap_beg) { best = len; *sv_beg = rb; *sv_end = re; }
-        } else { ref_pos++; c++; }
+            int anchored = (aligned_before >= LONGCALLD_DEKNOT_PAIR_SV_ANCHOR && n_aligned - aligned_before >= LONGCALLD_DEKNOT_PAIR_SV_ANCHOR);
+            if (anchored && len >= min_sv && len > best && rb <= gap_end && re >= gap_beg) { best = len; *sv_beg = rb; *sv_end = re; if (q_at) *q_at = q0; }
+        } else { ref_pos++; if (q != 5) { qpos++; aligned_before++; } c++; }
     }
     return best;
+}
+static int deknot_walk_sv_span(aln_str_t *as, hts_pos_t aln_ref_beg, hts_pos_t gap_beg, hts_pos_t gap_end, hts_pos_t min_sv,
+                               hts_pos_t *sv_beg, hts_pos_t *sv_end) {
+    return deknot_walk_sv_span2(as, aln_ref_beg, gap_beg, gap_end, min_sv, sv_beg, sv_end, NULL);
+}
+
+int32_t deknot_all_depth_median(bam_chunk_t *chunk) {
+    if (chunk->all_depth == NULL || chunk->n_all_depth <= 0) return 0;
+    int n = chunk->n_all_depth;
+    int32_t *v = (int32_t*)malloc(n * sizeof(int32_t));
+    memcpy(v, chunk->all_depth, n * sizeof(int32_t));
+    for (int i = 1; i < n; ++i) { int32_t x = v[i]; int j = i; while (j > 0 && v[j-1] > x) { v[j] = v[j-1]; j--; } v[j] = x; }
+    int32_t m = v[n / 2];
+    free(v);
+    return m;
+}
+
+#define LONGCALLD_DEKNOT_UNIQUE_SEG 2000
+#define LONGCALLD_DEKNOT_UNIQUE_SEG_DIV 0.10
+#define LONGCALLD_DEKNOT_UNIQUE_SEARCH 200000
+
+static int deknot_ref_seg_unique(bam_chunk_t *chunk, hts_pos_t seg_beg) {
+    int L = LONGCALLD_DEKNOT_UNIQUE_SEG;
+    if (seg_beg < chunk->ref_beg || seg_beg + L - 1 > chunk->ref_end) return 0;
+    hts_pos_t lo = seg_beg - LONGCALLD_DEKNOT_UNIQUE_SEARCH, hi = seg_beg + L - 1 + LONGCALLD_DEKNOT_UNIQUE_SEARCH;
+    if (lo < chunk->ref_beg) lo = chunk->ref_beg;
+    if (hi > chunk->ref_end) hi = chunk->ref_end;
+    int tlen = (int)(hi - lo + 1);
+    char *seg = (char*)malloc(L), *tgt = (char*)malloc(tlen);
+    int n_n = 0;
+    for (int i = 0; i < L; ++i) { seg[i] = toupper(chunk->ref_seq[seg_beg + i - chunk->ref_beg]); if (seg[i] == 'N') n_n++; }
+    for (int i = 0; i < tlen; ++i) tgt[i] = toupper(chunk->ref_seq[lo + i - chunk->ref_beg]);
+    for (hts_pos_t p = seg_beg; p < seg_beg + L; ++p) tgt[p - lo] = 'N';
+    int uniq = 0;
+    if (n_n * 10 < L) {
+        EdlibAlignResult r = edlibAlign(seg, L, tgt, tlen, edlibNewAlignConfig((int)(LONGCALLD_DEKNOT_UNIQUE_SEG_DIV * L), EDLIB_MODE_HW, EDLIB_TASK_DISTANCE, NULL, 0));
+        uniq = (r.status == EDLIB_STATUS_OK && r.editDistance < 0);
+        edlibFreeAlignResult(r);
+    }
+    free(seg); free(tgt);
+    return uniq;
+}
+
+hts_pos_t deknot_find_unique_flank(bam_chunk_t *chunk, hts_pos_t from, int dir, hts_pos_t limit, int32_t median) {
+    if (chunk->hq_depth == NULL || median <= 0) return -1;
+    double thr = LONGCALLD_DEKNOT_UNIQUE_FRAC * median;
+    int need = LONGCALLD_DEKNOT_UNIQUE_LEN / LONGCALLD_DEPTH_BIN;
+    int b = (int)((from - chunk->reg_beg) / LONGCALLD_DEPTH_BIN);
+    int lb = (int)((limit - chunk->reg_beg) / LONGCALLD_DEPTH_BIN);
+    int run = 0, run_inner = -1;
+    for (; dir < 0 ? b >= lb : b <= lb; b += dir) {
+        if (b < 0 || b >= chunk->n_all_depth) break;
+        if (chunk->hq_depth[b] >= thr) {
+            if (run == 0) run_inner = b;
+            if (++run >= need) {
+                hts_pos_t edge = chunk->reg_beg + (hts_pos_t)run_inner * LONGCALLD_DEPTH_BIN;
+                hts_pos_t inner = dir < 0 ? edge + LONGCALLD_DEPTH_BIN - 1 : edge;
+                hts_pos_t seg_beg = dir < 0 ? inner - LONGCALLD_DEKNOT_UNIQUE_SEG + 1 : inner;
+                if (deknot_ref_seg_unique(chunk, seg_beg)) return inner;
+                run = 0;
+            }
+        } else run = 0;
+    }
+    return -1;
+}
+
+static int deknot_junction_reads(const call_var_opt_t *opt, aln_str_t *as, int q_at, char **read_strs, int n_reads) {
+    int qlen = 0;
+    for (int c = 0; c < as->aln_len; ++c) if (as->query_aln[c] != 5) qlen++;
+    int f = LONGCALLD_DEKNOT_JUNC_FLANK;
+    if (q_at - f < 0 || q_at + f > qlen) return 0;
+    char *seg = (char*)malloc(2 * f);
+    int qi = 0, k = 0;
+    for (int c = 0; c < as->aln_len && k < 2 * f; ++c) {
+        if (as->query_aln[c] == 5) continue;
+        if (qi >= q_at - f && qi < q_at + f) seg[k++] = "ACGTN"[as->query_aln[c] < 5 ? as->query_aln[c] : 4];
+        qi++;
+    }
+    int max_ed = (int)((opt->is_ont ? 0.10 : 0.03) * 2 * f), n = 0;
+    for (int i = 0; i < n_reads; ++i) {
+        int rlen = strlen(read_strs[i]);
+        if (rlen < 2 * f) continue;
+        EdlibAlignResult r = edlibAlign(seg, 2 * f, read_strs[i], rlen, edlibNewAlignConfig(max_ed, EDLIB_MODE_HW, EDLIB_TASK_DISTANCE, NULL, 0));
+        if (r.status == EDLIB_STATUS_OK && r.editDistance >= 0) n++;
+        edlibFreeAlignResult(r);
+    }
+    free(seg);
+    return n;
+}
+
+static int deknot_merge_large_dels(aln_str_t *as, int min_len) {
+    int c0 = -1, c1 = -1, n_runs = 0, c = 0;
+    while (c < as->aln_len) {
+        if (as->target_aln[c] != 5 && as->query_aln[c] == 5) {
+            int b = c;
+            while (c < as->aln_len && as->target_aln[c] != 5 && as->query_aln[c] == 5) c++;
+            if (c - b >= min_len) { if (c0 < 0) c0 = b; c1 = c - 1; n_runs++; }
+        } else c++;
+    }
+    if (n_runs < 2) return 0;
+    int lr = 0, lq = 0;
+    uint8_t *R = (uint8_t*)malloc(c1 - c0 + 1), *Q = (uint8_t*)malloc(c1 - c0 + 1);
+    for (c = c0; c <= c1; ++c) {
+        if (as->target_aln[c] != 5) R[lr++] = as->target_aln[c];
+        if (as->query_aln[c] != 5) Q[lq++] = as->query_aln[c];
+    }
+    if (lq >= lr) { free(R); free(Q); return 0; }
+    int del = lr - lq, left = 1;
+    EdlibAlignResult best;
+    if (lq > 0) {
+        EdlibAlignResult rl = edlibAlign((char*)Q, lq, (char*)R, lq, edlibNewAlignConfig(-1, EDLIB_MODE_NW, EDLIB_TASK_PATH, NULL, 0));
+        EdlibAlignResult rr = edlibAlign((char*)Q, lq, (char*)R + del, lq, edlibNewAlignConfig(-1, EDLIB_MODE_NW, EDLIB_TASK_PATH, NULL, 0));
+        if (rl.status != EDLIB_STATUS_OK || rr.status != EDLIB_STATUS_OK) { edlibFreeAlignResult(rl); edlibFreeAlignResult(rr); free(R); free(Q); return 0; }
+        if (rr.editDistance < rl.editDistance) { left = 0; best = rr; edlibFreeAlignResult(rl); }
+        else { best = rl; edlibFreeAlignResult(rr); }
+    } else { best.alignment = NULL; best.alignmentLength = 0; }
+    int mid = best.alignmentLength + del;
+    int new_len = c0 + mid + (as->aln_len - c1 - 1);
+    uint8_t *mem = (uint8_t*)malloc(2 * new_len);
+    uint8_t *nt = mem, *nq = mem + new_len;
+    memcpy(nt, as->target_aln, c0); memcpy(nq, as->query_aln, c0);
+    int o = c0, ti = left ? 0 : del, qi = 0;
+    if (!left) for (int i = 0; i < del; ++i, ++o) { nt[o] = R[i]; nq[o] = 5; }
+    for (int i = 0; i < best.alignmentLength; ++i, ++o) {
+        unsigned char op = best.alignment[i];
+        if (op == EDLIB_EDOP_INSERT) { nt[o] = 5; nq[o] = Q[qi++]; }
+        else if (op == EDLIB_EDOP_DELETE) { nt[o] = R[ti++]; nq[o] = 5; }
+        else { nt[o] = R[ti++]; nq[o] = Q[qi++]; }
+    }
+    if (left) for (int i = lq; i < lr; ++i, ++o) { nt[o] = R[i]; nq[o] = 5; }
+    memcpy(nt + o, as->target_aln + c1 + 1, as->aln_len - c1 - 1);
+    memcpy(nq + o, as->query_aln + c1 + 1, as->aln_len - c1 - 1);
+    if (lq > 0) edlibFreeAlignResult(best);
+    free(R); free(Q);
+    free(as->target_aln);
+    as->target_aln = nt; as->query_aln = nq; as->aln_len = new_len;
+    as->target_beg = 0; as->target_end = new_len - 1; as->query_beg = 0; as->query_end = new_len - 1;
+    return 1;
+}
+
+static int deknot_large_del_union(aln_str_t *as, hts_pos_t aln_ref_beg, int min_len, hts_pos_t *b, hts_pos_t *e) {
+    hts_pos_t ref_pos = aln_ref_beg; int n = 0, c = 0;
+    while (c < as->aln_len) {
+        if (as->target_aln[c] != 5 && as->query_aln[c] == 5) {
+            hts_pos_t rb = ref_pos; int len = 0;
+            while (c < as->aln_len && as->target_aln[c] != 5 && as->query_aln[c] == 5) { len++; ref_pos++; c++; }
+            if (len >= min_len) { if (n == 0 || rb < *b) *b = rb; if (n == 0 || ref_pos - 1 > *e) *e = ref_pos - 1; n++; }
+        } else { if (as->target_aln[c] != 5) ref_pos++; c++; }
+    }
+    return n;
 }
 
 // local assembly rescue over an expanded window: full-length read subsequences are assembled with DeKnot,
@@ -2147,11 +2370,40 @@ static int deknot_walk_sv_span(aln_str_t *as, hts_pos_t aln_ref_beg, hts_pos_t g
 // commits results into clu_n_seqs/clu_read_ids/aln_strs only when it improves on n_cons_existing.
 // pair_beg/pair_end >= 0: the partner breakpoint of the noisy region (both breakpoints of one large SV are known);
 // the window, the span check and the trimmed region then cover both breakpoints.
+static int deknot_lowmq_window_seq(bam1_t *b, hts_pos_t beg, hts_pos_t end, char **out) {
+    uint32_t *cigar = bam_get_cigar(b); int n_cigar = b->core.n_cigar, qlen = b->core.l_qseq;
+    hts_pos_t ref = b->core.pos + 1; int q = 0, qs = -1, qe = -1;
+    for (int i = 0; i < n_cigar; ++i) {
+        int op = bam_cigar_op(cigar[i]), len = bam_cigar_oplen(cigar[i]);
+        if (op == BAM_CMATCH || op == BAM_CEQUAL || op == BAM_CDIFF) {
+            if (qs < 0 && beg >= ref && beg < ref + len) qs = q + (int)(beg - ref);
+            if (qe < 0 && end >= ref && end < ref + len) qe = q + (int)(end - ref);
+            ref += len; q += len;
+        } else if (op == BAM_CINS || op == BAM_CSOFT_CLIP) {
+            q += len;
+        } else if (op == BAM_CDEL || op == BAM_CREF_SKIP) {
+            if (qs < 0 && beg >= ref && beg < ref + len) qs = q;
+            if (qe < 0 && end >= ref && end < ref + len) qe = q - 1;
+            ref += len;
+        }
+    }
+    if (b->core.pos + 1 > end || ref - 1 < beg) return 0;
+    if (qs < 0) qs = 0;
+    if (qe < 0) qe = qlen - 1;
+    if (qe < qs || qlen <= 0) return 0;
+    uint8_t *s = bam_get_seq(b);
+    int n = qe - qs + 1;
+    *out = (char*)malloc(n + 1);
+    for (int i = 0; i < n; ++i) (*out)[i] = seq_nt16_str[bam_seqi(s, qs + i)];
+    (*out)[n] = '\0';
+    return n;
+}
+
 static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
                      hts_pos_t pair_beg, hts_pos_t pair_end,
                      int n_noisy_reads, int *noisy_reads, hts_pos_t flank_len, int abort_on_edge, int *hit_window_edge, int pass,
                      int n_cons_existing, int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs, hts_pos_t *var_reg_beg,
-                     hts_pos_t *sv_beg, hts_pos_t *sv_end) {
+                     hts_pos_t *sv_beg, hts_pos_t *sv_end, hts_pos_t win_lo, hts_pos_t win_hi, int *junc_reads) {
     // region whose variants are wanted: the noisy region, or the span over both breakpoints
     int paired = (pair_beg >= 0 && pair_end >= pair_beg);
     hts_pos_t reg_beg = noisy_reg_beg, reg_end = noisy_reg_end;
@@ -2159,7 +2411,8 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         if (pair_beg < reg_beg) reg_beg = pair_beg;
         if (pair_end > reg_end) reg_end = pair_end;
     }
-    hts_pos_t max_win = paired ? LONGCALLD_DEKNOT_PAIR_MAX_WIN : LONGCALLD_DEKNOT_MAX_WIN;
+    hts_pos_t max_win = pass == DK_PASS_DEPTH ? LONGCALLD_DEKNOT_DEPTH_MAX_WIN : paired ? LONGCALLD_DEKNOT_PAIR_MAX_WIN : LONGCALLD_DEKNOT_MAX_WIN;
+    if (junc_reads != NULL) *junc_reads = -1;
     int max_asm_reads = paired ? LONGCALLD_DEKNOT_PAIR_MAX_ASM_READS : LONGCALLD_DEKNOT_MAX_ASM_READS;
     // a region that already has a consensus is only worth re-assembling when it shows a
     // breakpoint signature: multiple reads that fail to fully span it (clips/gaps at the edges)
@@ -2174,8 +2427,8 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         if (n_nonfull < 2) { dk_stats_count(&dk_stats.n_skip_no_breakpoint); return -1; }
     }
     *hit_window_edge = 0;
-    hts_pos_t exp_beg = reg_beg - flank_len;
-    hts_pos_t exp_end = reg_end + flank_len;
+    hts_pos_t exp_beg = (win_lo >= 0 && win_lo < reg_beg ? win_lo : reg_beg) - flank_len;
+    hts_pos_t exp_end = (win_hi > reg_end ? win_hi : reg_end) + flank_len;
     if (exp_beg < 1) exp_beg = 1;
     uint8_t *ref_seq = NULL;
     int ref_seq_len = collect_reg_ref_bseq(chunk, &exp_beg, &exp_end, &ref_seq);
@@ -2225,8 +2478,13 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         read_ids = kept; n_reads = n_kept;
     }
 
-    char **read_strs = (char**)malloc(n_reads * sizeof(char*));
-    char **read_names = (char**)malloc(n_reads * sizeof(char*));
+    int n_lowmq = 0;
+    for (int i = 0; i < chunk->n_lowmq_reads; ++i) {
+        bam1_t *b = chunk->lowmq_reads[i];
+        if (b->core.pos + 1 <= exp_end && bam_endpos(b) >= exp_beg) n_lowmq++;
+    }
+    char **read_strs = (char**)malloc((n_reads + n_lowmq) * sizeof(char*));
+    char **read_names = (char**)malloc((n_reads + n_lowmq) * sizeof(char*));
     for (int i = 0; i < n_reads; ++i) {
         int len = 0, cover = 0, rb = 0, re = 0; uint8_t *bseq = NULL;
         collect_noisy_read_info1(opt, chunk, read_ids[i], exp_beg, exp_end, &len, &bseq, &cover, &rb, &re);
@@ -2236,6 +2494,22 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         free(bseq);
         read_names[i] = (char*)malloc(16);
         snprintf(read_names[i], 16, "r%d", i);
+    }
+    if (n_lowmq > 0) {
+        int n0 = n_reads;
+        for (int i = 0; i < chunk->n_lowmq_reads; ++i) {
+            bam1_t *b = chunk->lowmq_reads[i];
+            if (b->core.pos + 1 > exp_end || bam_endpos(b) < exp_beg) continue;
+            char *s = NULL;
+            if (deknot_lowmq_window_seq(b, exp_beg, exp_end, &s) <= 0) continue;
+            read_strs[n_reads] = s;
+            read_names[n_reads] = (char*)malloc(16);
+            snprintf(read_names[n_reads], 16, "q%d", n_reads);
+            n_reads++;
+        }
+        if (LONGCALLD_VERBOSE >= 1)
+            fprintf(stderr, "DeKnotLowMQ %s:%" PRIi64 "-%" PRIi64 " window %" PRIi64 "-%" PRIi64 " added %d low-MAPQ reads to %d\n",
+                    chunk->tname, noisy_reg_beg, noisy_reg_end, exp_beg, exp_end, n_reads - n0, n0);
     }
     dk_opt_t dk_opt; dk_opt_init(&dk_opt);
     dk_opt.check_strand = (opt->is_ont != 0);
@@ -2266,6 +2540,15 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
     if (span_end > exp_end) span_end = exp_end;
     int span_beg_off = (int)(span_beg - exp_beg), span_end_off = (int)(span_end - exp_beg);
 
+    // paired pass: the walks have to deliver the SV the breakpoint pair predicts, an indel of at least
+    // max(5 kb, half the breakpoint distance) whose reference span overlaps the interval between the two breakpoints
+    hts_pos_t gap_beg = 0, gap_end = 0, min_sv = 0;
+    if (paired) {
+        if (pair_beg > noisy_reg_end) { gap_beg = noisy_reg_end; gap_end = pair_beg; }
+        else { gap_beg = pair_end; gap_end = noisy_reg_beg; }
+        min_sv = (gap_end - gap_beg) / 2;
+        if (min_sv < LONGCALLD_DEKNOT_PAIR_MIN_SV) min_sv = LONGCALLD_DEKNOT_PAIR_MIN_SV;
+    }
     // walks to align: all of them for one or two walks; for more, the longest few that are long enough to span
     int n_aln = 0;
     int *aln_order = (int*)malloc(n_walks * sizeof(int));
@@ -2288,15 +2571,25 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
     aln_str_t *cand_alns = (aln_str_t*)calloc(n_aln > 0 ? n_aln : 1, sizeof(aln_str_t));
     int *cand_score = (int*)malloc((n_aln > 0 ? n_aln : 1) * sizeof(int));
     int n_cand = 0, aln_ok = 1;
+    double aln_t0 = realtime();
     for (int k = 0; k < n_aln; ++k) {
         int rb = -1, re = -1, sc = 0;
-        int ok = deknot_align_walk(opt, ref_seq, ref_seq_len, walks->walks[aln_order[k]], cand_alns + n_cand, &rb, &re, &sc);
-        if (LONGCALLD_VERBOSE >= 2)
-            fprintf(stderr, "DeKnotWalk %s:%" PRIi64 "-%" PRIi64 " walk=%d len=%d aligned=%d ref=%" PRIi64 "-%" PRIi64 " score=%d span=%d\n",
-                    chunk->tname, noisy_reg_beg, noisy_reg_end, aln_order[k], wlens[aln_order[k]], ok,
+        int capped = 0;
+        int ok = deknot_align_walk(opt, ref_seq, ref_seq_len, walks->walks[aln_order[k]], cand_alns + n_cand, &rb, &re, &sc,
+                                   paired ? LONGCALLD_DEKNOT_PAIR_WFA_CAP_DIV : 0.0, &capped);
+        if (capped) dk_stats_count(&dk_stats.n_wfa_capped);
+        if (LONGCALLD_VERBOSE >= 2 || (paired && LONGCALLD_VERBOSE >= 1))
+            fprintf(stderr, "DeKnotWalk %s:%" PRIi64 "-%" PRIi64 " walk=%d len=%d aligned=%d%s ref=%" PRIi64 "-%" PRIi64 " score=%d span=%d\n",
+                    chunk->tname, noisy_reg_beg, noisy_reg_end, aln_order[k], wlens[aln_order[k]], ok, capped ? " (WFA score cap reached)" : "",
                     ok ? exp_beg + rb : (hts_pos_t)-1, ok ? exp_beg + re : (hts_pos_t)-1, sc, ok && rb <= span_beg_off && re >= span_end_off);
         if (!ok) {
-            if (n_walks <= 2) { aln_ok = 0; break; } // one or two walks: every walk has to align
+            if (n_walks <= 2 && !paired) { aln_ok = 0; break; }
+            continue;
+        }
+        if (ok && n_walks > 2 && paired && deknot_aln_edge_gap(cand_alns + n_cand, (int)min_sv, LONGCALLD_DEKNOT_PAIR_EDGE_GAP)) {
+            if (LONGCALLD_VERBOSE >= 2) fprintf(stderr, "DeKnotWalk %s:%" PRIi64 "-%" PRIi64 " walk=%d dropped: SV run touches the window edge\n", chunk->tname, noisy_reg_beg, noisy_reg_end, aln_order[k]);
+            free(cand_alns[n_cand].target_aln);
+            cand_alns[n_cand].target_aln = NULL; cand_alns[n_cand].query_aln = NULL; cand_alns[n_cand].aln_len = 0;
             continue;
         }
         if (n_walks > 2 && (rb > span_beg_off || re < span_end_off)) { // no aligned bases through both flanks
@@ -2307,6 +2600,7 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         cand_score[n_cand++] = sc;
     }
     free(aln_order); free(wlens);
+    dk_aln_secs = realtime() - aln_t0;
 
     aln_str_t walk_alns[2]; int walk_score[2] = {0, 0};
     for (int i = 0; i < 2; ++i) { walk_alns[i].target_aln = NULL; walk_alns[i].query_aln = NULL; walk_alns[i].aln_len = 0; }
@@ -2317,17 +2611,26 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         if (n_cand >= 2) {
             uint8_t **sub = (uint8_t**)malloc(n_cand * sizeof(uint8_t*));
             int *sub_len = (int*)malloc(n_cand * sizeof(int));
-            for (int i = 0; i < n_cand; ++i) sub[i] = deknot_aln_sub_query(cand_alns + i, span_beg_off, span_end_off, sub_len + i);
+            hts_pos_t *net = (hts_pos_t*)malloc(n_cand * sizeof(hts_pos_t));
+            for (int i = 0; i < n_cand; ++i) {
+                sub[i] = deknot_aln_sub_query(cand_alns + i, span_beg_off, span_end_off, sub_len + i);
+                net[i] = deknot_aln_net_change(cand_alns + i, span_beg_off, span_end_off);
+            }
             int best = INT32_MIN;
             for (int i = 0; i < n_cand; ++i) {
                 for (int j = i+1; j < n_cand; ++j) {
                     int gap = 0, ed = deknot_pair_diff(sub[i], sub_len[i], sub[j], sub_len[j], &gap);
-                    if (ed < 0 || gap < opt->min_sv_len) continue;
+                    hts_pos_t dnet = net[i] > net[j] ? net[i] - net[j] : net[j] - net[i];
+                    int differ = (ed >= 0 && gap >= opt->min_sv_len) || (paired && dnet >= opt->min_sv_len);
+                    if (LONGCALLD_VERBOSE >= 2)
+                        fprintf(stderr, "DeKnotPairSel %s:%" PRIi64 "-%" PRIi64 " cand=%d,%d sub_len=%d,%d ed=%d max_gap=%d net=%" PRIi64 ",%" PRIi64 " scores=%d,%d differ=%d\n",
+                                chunk->tname, noisy_reg_beg, noisy_reg_end, i, j, sub_len[i], sub_len[j], ed, gap, net[i], net[j], cand_score[i], cand_score[j], differ);
+                    if (!differ) continue;
                     if (cand_score[i] + cand_score[j] > best) { best = cand_score[i] + cand_score[j]; pick0 = i; pick1 = j; }
                 }
             }
             for (int i = 0; i < n_cand; ++i) free(sub[i]);
-            free(sub); free(sub_len);
+            free(sub); free(sub_len); free(net);
         }
         if (pick0 < 0) {
             for (int i = 0; i < n_cand; ++i) if (pick0 < 0 || cand_score[i] > cand_score[pick0]) pick0 = i;
@@ -2341,6 +2644,7 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         sel = (rescue_n == 2) ? DK_SEL_PAIR : (rescue_n == 1) ? DK_SEL_SINGLE : DK_SEL_NONE;
     } else if (aln_ok) {
         for (int i = 0; i < n_cand; ++i) { walk_alns[i] = cand_alns[i]; walk_score[i] = cand_score[i]; }
+        if (paired) rescue_n = n_cand;
     } else {
         for (int i = 0; i < n_cand; ++i) free(cand_alns[i].target_aln);
     }
@@ -2354,22 +2658,28 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         free(read_strs); free(read_names); free(read_ids); free(ref_seq);
         return -1;
     }
-    // paired pass: the walks have to deliver the SV the breakpoint pair predicts, an indel of at least
-    // max(5 kb, half the breakpoint distance) whose reference span overlaps the interval between the two breakpoints
-    hts_pos_t gap_beg = 0, gap_end = 0, min_sv = 0;
-    if (paired) {
-        if (pair_beg > noisy_reg_end) { gap_beg = noisy_reg_end; gap_end = pair_beg; }
-        else { gap_beg = pair_end; gap_end = noisy_reg_beg; }
-        min_sv = (gap_end - gap_beg) / 2;
-        if (min_sv < LONGCALLD_DEKNOT_PAIR_MIN_SV) min_sv = LONGCALLD_DEKNOT_PAIR_MIN_SV;
-    }
     hts_pos_t pred_sv_beg = -1, pred_sv_end = -1; // reference span of the predicted SV over the selected walks
     if (aln_ok && paired) {
-        int found = 0;
+        int found = 0, junc_ok = 1, junc_min = -1, keep[2] = {1, 1}, n_dropped = 0, n_sv = 0;
+        int32_t median = deknot_all_depth_median(chunk);
         for (int i = 0; i < rescue_n; ++i) {
-            hts_pos_t sb = -1, se = -1;
-            int len = deknot_walk_sv_span(walk_alns + i, exp_beg, gap_beg, gap_end, min_sv, &sb, &se);
-            if (LONGCALLD_VERBOSE >= 2)
+            hts_pos_t sb = -1, se = -1; int q_at = -1;
+            int len = deknot_walk_sv_span2(walk_alns + i, exp_beg, gap_beg, gap_end, min_sv, &sb, &se, &q_at);
+            if (len > 0) {
+                n_sv++;
+                int nj = deknot_junction_reads(opt, walk_alns + i, q_at, read_strs, n_reads);
+                hts_pos_t lu = deknot_find_unique_flank(chunk, sb - 1, -1, exp_beg, median);
+                hts_pos_t ru = deknot_find_unique_flank(chunk, se + 1, 1, exp_end, median);
+                int anchored = (lu >= 0 || ru >= 0 || median <= 0);
+                int pass_gate = (nj >= LONGCALLD_DEKNOT_JUNC_MIN_READS && anchored);
+                if (LONGCALLD_VERBOSE >= 1)
+                    fprintf(stderr, "DeKnotJunction %s:%" PRIi64 "-%" PRIi64 " pass=%s walk=%d sv=%" PRIi64 "-%" PRIi64 " (%d) junction_reads=%d/%d unique_flank_left=%" PRIi64 " right=%" PRIi64 " median=%d%s\n",
+                            chunk->tname, noisy_reg_beg, noisy_reg_end, dk_pass_names[pass], i, sb, se, len, nj, n_reads, lu, ru, median,
+                            pass_gate ? "" : " DROP");
+                if (!pass_gate) { keep[i] = 0; n_dropped++; continue; }
+                if (junc_min < 0 || nj < junc_min) junc_min = nj;
+            }
+            if (LONGCALLD_VERBOSE >= 1)
                 fprintf(stderr, "DeKnotPairGate %s:%" PRIi64 "-%" PRIi64 " walk=%d predicted>=%" PRIi64 " in %" PRIi64 "-%" PRIi64 " found=%d span=%" PRIi64 "-%" PRIi64 "\n",
                         chunk->tname, noisy_reg_beg, noisy_reg_end, i, min_sv, gap_beg, gap_end, len, sb, se);
             if (len > 0) {
@@ -2378,9 +2688,20 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
                 if (se > pred_sv_end) pred_sv_end = se;
             }
         }
-        if (!found) {
+        if (n_dropped > 0) {
+            int n_kept = 0;
+            for (int i = 0; i < rescue_n; ++i) {
+                if (!keep[i]) { free(walk_alns[i].target_aln); walk_alns[i].target_aln = NULL; continue; }
+                if (n_kept != i) { walk_alns[n_kept] = walk_alns[i]; walk_score[n_kept] = walk_score[i]; walk_alns[i].target_aln = NULL; }
+                n_kept++;
+            }
+            rescue_n = n_kept;
+        }
+        if (!found && n_sv > 0) junc_ok = 0;
+        if (junc_reads != NULL) *junc_reads = junc_min;
+        if (!found || !junc_ok) {
             for (int i = 0; i < rescue_n; ++i) free(walk_alns[i].target_aln);
-            dk_stats_add_attempt(chunk, noisy_reg_beg, noisy_reg_end, exp_beg, exp_end, n_reads, n_noisy_reads, subsampled, n_walks, walks_null, demoted, sel, collapsed, asm_secs, pass, DK_OUT_PAIR_NO_SV);
+            dk_stats_add_attempt(chunk, noisy_reg_beg, noisy_reg_end, exp_beg, exp_end, n_reads, n_noisy_reads, subsampled, n_walks, walks_null, demoted, sel, collapsed, asm_secs, pass, !junc_ok ? DK_OUT_PAIR_NO_JUNC : rescue_n == 0 ? DK_OUT_POOR_ALN : DK_OUT_PAIR_NO_SV);
             dk_walks_free(walks);
             for (int i = 0; i < n_reads; ++i) { free(read_strs[i]); free(read_names[i]); }
             free(read_strs); free(read_names); free(read_ids); free(ref_seq);
@@ -2417,8 +2738,20 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         }
         uint8_t *cons_seqs[2] = {NULL, NULL}; int cons_lens[2] = {0, 0};
         int trim_ok = 1;
+        for (int i = 0; i < rescue_n; ++i) deknot_trim_aln(walk_alns + i, exp_beg, win_beg, win_end);
+        if (paired && rescue_n == 2) {
+            hts_pos_t b0 = 0, e0 = 0, b1 = 0, e1 = 0;
+            int n0 = deknot_large_del_union(walk_alns + 0, win_beg, LONGCALLD_DEKNOT_PAIR_MIN_SV, &b0, &e0);
+            int n1 = deknot_large_del_union(walk_alns + 1, win_beg, LONGCALLD_DEKNOT_PAIR_MIN_SV, &b1, &e1);
+            if (n0 > 0 && n1 > 0 && b0 <= e1 && b1 <= e0) {
+                for (int i = 0; i < 2; ++i) {
+                    int merged = deknot_merge_large_dels(walk_alns + i, LONGCALLD_DEKNOT_PAIR_MIN_SV);
+                    if (merged && LONGCALLD_VERBOSE >= 1)
+                        fprintf(stderr, "DeKnotMergeDel %s:%" PRIi64 "-%" PRIi64 " walk=%d: large deletion pieces merged into one record\n", chunk->tname, noisy_reg_beg, noisy_reg_end, i);
+                }
+            }
+        }
         for (int i = 0; i < rescue_n; ++i) {
-            deknot_trim_aln(walk_alns + i, exp_beg, win_beg, win_end);
             if (walk_alns[i].aln_len <= 0) trim_ok = 0;
             // trimmed walk sequence in cons space
             cons_seqs[i] = (uint8_t*)malloc((walk_alns[i].aln_len > 0 ? walk_alns[i].aln_len : 1) * sizeof(uint8_t));
@@ -2458,6 +2791,7 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         }
         // assign each noisy-region read to the walk it matches best, and record its read-vs-cons alignment
         // (clusters are restricted to the noisy-region read set: the aln_str slots are sized for it)
+        double reads_t0 = realtime();
         for (int k = 0; trim_ok && k < n_noisy_reads; ++k) {
             int rlen = 0, rcover = 0, rb = 0, re = 0; uint8_t *rseq = NULL;
             collect_noisy_read_info1(opt, chunk, noisy_reads[k], win_beg, win_end, &rlen, &rseq, &rcover, &rb, &re);
@@ -2497,6 +2831,7 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
             clu_read_ids[best_i][clu_n_seqs[best_i]++] = noisy_reads[k];
         }
         for (int i = 0; i < rescue_n; ++i) free(cons_seqs[i]);
+        dk_read_secs = realtime() - reads_t0;
         // a committed walk with no read support is not a haplotype: demote to a single consensus
         if (trim_ok && rescue_n == 2 && (clu_n_seqs[0] == 0 || clu_n_seqs[1] == 0)) {
             if (clu_n_seqs[0] == 0) {
@@ -2718,18 +3053,23 @@ int deknot_find_partner(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t
 
 // local-assembly rescue over one window covering the noisy region and its partner breakpoint [pair_beg, pair_end]
 // (reads: both breakpoint regions' reads). returns the committed consensus count, or -1; on a commit the walks carry
-// the SV the pair predicts and [sv_beg, sv_end] is its reference span
 int deknot_sv_rescue_paired(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
                             hts_pos_t pair_beg, hts_pos_t pair_end, int n_noisy_reads, int *noisy_reads,
                             int n_cons_existing, int *clu_n_seqs, int **clu_read_ids, aln_str_t **aln_strs, hts_pos_t *var_reg_beg,
-                            hts_pos_t *sv_beg, hts_pos_t *sv_end) {
+                            hts_pos_t *sv_beg, hts_pos_t *sv_end, int depth_triggered, hts_pos_t win_lo, hts_pos_t win_hi, int *junc_reads) {
     int hit_edge = 0;
     *sv_beg = -1; *sv_end = -1;
     int ret = deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, pair_beg, pair_end, n_noisy_reads, noisy_reads,
-                                    LONGCALLD_DEKNOT_PAIR_FLANK_LEN, 0, &hit_edge, DK_PASS_PAIRED,
-                                    n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg, sv_beg, sv_end);
+                                    LONGCALLD_DEKNOT_PAIR_FLANK_LEN, 0, &hit_edge, depth_triggered ? DK_PASS_DEPTH : DK_PASS_PAIRED,
+                                    n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg, sv_beg, sv_end, win_lo, win_hi, junc_reads);
     dk_stats_add_region(n_cons_existing, ret);
     return ret;
+}
+
+void deknot_stats_add_depth_runs(int n) {
+    pthread_mutex_lock(&dk_stats.lock);
+    dk_stats.n_depth_runs += n;
+    pthread_mutex_unlock(&dk_stats.lock);
 }
 
 int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
@@ -2751,18 +3091,18 @@ int deknot_sv_rescue(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t no
     if (n_long_clip >= 2) {
         ret = deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, -1, -1, n_noisy_reads, noisy_reads,
                                     LONGCALLD_DEKNOT_FLANK_LEN, 0, &hit_edge, DK_PASS_WIDE,
-                                    n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg, NULL, NULL);
+                                    n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg, NULL, NULL, -1, -1, NULL);
         dk_stats_add_region(n_cons_existing, ret);
         return ret;
     }
     ret = deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, -1, -1, n_noisy_reads, noisy_reads,
                                 LONGCALLD_DEKNOT_SMALL_FLANK_LEN, 1, &hit_edge, DK_PASS_SMALL,
-                                n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg, NULL, NULL);
+                                n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg, NULL, NULL, -1, -1, NULL);
     // an indel run crossing the small window's edge means an SV larger than the flank: retry wide
     if (ret < 0 && hit_edge) {
         ret = deknot_sv_rescue_core(opt, chunk, noisy_reg_beg, noisy_reg_end, -1, -1, n_noisy_reads, noisy_reads,
                                     LONGCALLD_DEKNOT_FLANK_LEN, 0, &hit_edge, DK_PASS_WIDE_RETRY,
-                                    n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg, NULL, NULL);
+                                    n_cons_existing, clu_n_seqs, clu_read_ids, aln_strs, var_reg_beg, NULL, NULL, -1, -1, NULL);
     }
     dk_stats_add_region(n_cons_existing, ret);
     return ret;

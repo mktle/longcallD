@@ -18,6 +18,8 @@
 // #define BAM_RECORD_LARGE_CLIP 0x4
 
 #define bam_bseq2base(bseq, qi) seq_nt16_str[bam_seqi(bseq, qi)]
+#define LONGCALLD_DEPTH_BIN 1000
+#define LONGCALLD_DEKNOT_UNIQUE_MQ 30
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,6 +69,9 @@ typedef struct bam_chunk_t {
     int *n_up_ovlp_reads, *n_down_ovlp_reads, *n_up_ovlp_skip_reads, *n_down_ovlp_skip_reads; // number of reads overlapping with up/downstream bam chunk
     int **up_ovlp_read_i, **down_ovlp_read_i;
     bam1_t **reads;
+    int32_t *all_depth; int n_all_depth;
+    bam1_t **lowmq_reads; int n_lowmq_reads, m_lowmq_reads;
+    int32_t *hq_depth;
     // intermidiate
     int *n_clean_agree_snps, *n_clean_conflict_snps; // size: m_reads; XXX include both het and hom clean vars
     uint8_t *is_ont_palindrome; // size: m_reads, 1: palindromic read, 0: non-palindromic read

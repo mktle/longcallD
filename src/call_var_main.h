@@ -51,9 +51,20 @@
 #define LONGCALLD_DEKNOT_PAIR_MAX_WIN 250000 // max expanded window size for a paired-breakpoint assembly
 #define LONGCALLD_DEKNOT_PAIR_MAX_DIST 200000 // the partner breakpoint is searched within this distance of the noisy region
 #define LONGCALLD_DEKNOT_PAIR_MAX_ASM_READS 300 // subsample the paired-window read set beyond this
+#define LONGCALLD_DEKNOT_PAIR_TRIM_FLANK 500
 #define LONGCALLD_DEKNOT_PAIR_MIN_CLIP 500 // reads with a clip this long carry the partner breakpoint (SA tag or placed tail)
 #define LONGCALLD_LARGE_DEL_COVER_LEN 5000 // a read covers a longer deletion of the other haplotype when it spans either breakpoint
 #define LONGCALLD_LARGE_DEL_COVER_FLANK 20 // with this many consensus bases on both sides of the breakpoint
+#define LONGCALLD_DEKNOT_DEPTH_MIN_MEDIAN_X 2
+#define LONGCALLD_DEKNOT_DEPTH_LOW_FRAC 0.65
+#define LONGCALLD_DEKNOT_DEPTH_MIN_RUN 20000
+#define LONGCALLD_DEKNOT_DEPTH_MAX_RUNS 3
+#define LONGCALLD_DEKNOT_DEPTH_MAX_WIN 400000
+#define LONGCALLD_DEKNOT_UNIQUE_FRAC 0.5
+#define LONGCALLD_DEKNOT_UNIQUE_LEN 10000
+#define LONGCALLD_DEKNOT_JUNC_FLANK 1000
+#define LONGCALLD_DEKNOT_JUNC_MIN_READS 3
+#define LONGCALLD_DEKNOT_DEPTH_REG_LEN 500
 #define LONGCALLD_DEKNOT_PAIR_INSIDE_FRAC 0.9 // a noisy region with this fraction of its length inside a committed paired SV is covered by it
 #define LONGCALLD_NOISY_REG_READS 2 // >= 5 reads supporting noisy region
 // #define LONGCALLD_NOISY_REG_RATIO 0.20 // >= 25% reads supporting noisy region
