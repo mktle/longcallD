@@ -87,6 +87,7 @@ else
 endif
 
 CFLAGS = $(OPT_FLAGS) $(EXTRA_FLAGS) -DLONGCALLD_VERSION=\"$(LONGCALLD_VERSION)\"
+DEPFLAGS = -MMD -MP
 
 BIN_LDFLAGS = -rdynamic
 
@@ -134,7 +135,7 @@ ifneq ($(gdb),)
 endif
 
 .c.o:
-	$(CC) -c $(CFLAGS) $(INCLUDE) $< -o $@
+	$(CC) -c $(CFLAGS) $(DEPFLAGS) $(INCLUDE) $< -o $@
 
 all: $(HTS_ALL) $(EDLIB) $(ABPOA_LIB) $(WFA2_LIB) $(BIN)
 
@@ -170,7 +171,7 @@ $(BIN): $(OBJS) $(ABPOA_LIB) $(HTSLIB) $(WFA2_LIB) $(DEKNOT_LIB)
 # 	$(CC) $(OBJS) -o $@ $(LIB) $(PG_FLAG)
 
 $(SRC_DIR)/align.o: $(SRC_DIR)/align.c $(SRC_DIR)/align.h $(SRC_DIR)/utils.h $(SRC_DIR)/bam_utils.h $(SRC_DIR)/seq.h
-	$(CC) -c -DUSE_SIMDE -DSIMDE_ENABLE_NATIVE_ALIASES $(CFLAGS) $< $(INCLUDE) -o $@
+	$(CC) -c -DUSE_SIMDE -DSIMDE_ENABLE_NATIVE_ALIASES $(CFLAGS) $(DEPFLAGS) $< $(INCLUDE) -o $@
 
 $(SRC_DIR)/assign_aln_hap.o: $(SRC_DIR)/assign_aln_hap.c $(SRC_DIR)/assign_aln_hap.h $(SRC_DIR)/utils.h $(SRC_DIR)/bam_utils.h
 $(SRC_DIR)/bam_utils.o: $(SRC_DIR)/bam_utils.c $(SRC_DIR)/bam_utils.h $(SRC_DIR)/utils.h
@@ -187,12 +188,14 @@ $(SRC_DIR)/sdust.o: $(SRC_DIR)/sdust.c $(SRC_DIR)/sdust.h $(SRC_DIR)/kdq.h $(SRC
 $(SRC_DIR)/utils.o: $(SRC_DIR)/utils.c $(SRC_DIR)/utils.h $(SRC_DIR)/ksort.h $(SRC_DIR)/kseq.h
 $(SRC_DIR)/vcf_utils.o: $(SRC_DIR)/vcf_utils.c $(SRC_DIR)/vcf_utils.h $(SRC_DIR)/utils.h
 
+-include $(CSOURCE:.c=.d)
+
 .PHONY: all hts_all abpoa_all wfa2_all clean clean_all clean_hts clean_abpoa clean_wfa2
 
 clean:
-	rm -f $(SRC_DIR)/*.o $(BIN)
+	rm -f $(SRC_DIR)/*.o $(SRC_DIR)/*.d $(BIN)
 clean_all:
-	rm -f $(SRC_DIR)/*.o $(BIN) $(HTSLIB) $(ABPOA_LIB) $(WFA2_LIB)
+	rm -f $(SRC_DIR)/*.o $(SRC_DIR)/*.d $(BIN) $(HTSLIB) $(ABPOA_LIB) $(WFA2_LIB)
 clean_hts:
 	rm -f $(HTSLIB)
 clean_abpoa:
