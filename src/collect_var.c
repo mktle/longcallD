@@ -1480,6 +1480,8 @@ int cal_var_QUAL1(int ref_depth, int alt_depth, double logp, double log1p, int m
 // 1) filter out low-quality variants, e.g., P(var|hap,phasing)
 // 2) merge variants with the overlapping pos & ref_len (e.g., ACGT -> A, ACGTCGT) XXX
 // 3) extend phase blocks if possible, e.g., if ≥ 1 read supports the longer phase block
+static int deknot_rescue_enabled(const call_var_opt_t *opt);
+
 int make_variants(const call_var_opt_t *opt, bam_chunk_t *chunk, var_t **_var) {
     int n_cand_vars = chunk->n_cand_vars;
     if (n_cand_vars <= 0) return 0;
@@ -1522,6 +1524,18 @@ int make_variants(const call_var_opt_t *opt, bam_chunk_t *chunk, var_t **_var) {
             int alt = hap1_alle != LONGCALLD_REF_ALLELE ? hap1_alle : hap2_alle;
             hap1_alle = hap2_alle = alt; is_hom = 1;
         }
+        // a large SV from a local assembly separates the phase blocks on its two sides (no read links them), so the
+        // per-haplotype majority vote can leave both haplotypes as reference although the junction reads carry the
+        // SV: call it heterozygous and unphased
+        int large_sv_unphased = 0;
+        if (((cand_vars[cand_i].var_type == BAM_CDEL && cand_vars[cand_i].ref_len >= LONGCALLD_LARGE_DEL_COVER_LEN)
+             || (cand_vars[cand_i].var_type == BAM_CINS && cand_vars[cand_i].alt_len >= LONGCALLD_LARGE_INS_COVER_LEN))
+            && (chunk->var_i_to_cate[cand_i] & (LONGCALLD_NOISY_CAND_HET_VAR | LONGCALLD_NOISY_CAND_HOM_VAR))
+            && cand_vars[cand_i].alle_covs != NULL && hap1_alle == LONGCALLD_REF_ALLELE && hap2_alle == LONGCALLD_REF_ALLELE
+            && cand_vars[cand_i].alle_covs[1] >= LONGCALLD_LARGE_SV_MIN_ALT_READS
+            && cand_vars[cand_i].alle_covs[1] >= opt->min_af * cand_vars[cand_i].total_cov) {
+            hap2_alle = 1; is_hom = 0; large_sv_unphased = 1;
+        }
 
         var->vars[i].type = cand_vars[cand_i].var_type;
         if (chunk->var_i_to_cate[cand_i] == LONGCALLD_CAND_SOMATIC_VAR) var->vars[i].is_somatic = 1;
@@ -1543,7 +1557,7 @@ int make_variants(const call_var_opt_t *opt, bam_chunk_t *chunk, var_t **_var) {
             var->vars[i].te_seq_i = cand_vars[cand_i].te_seq_i;
             var->vars[i].te_is_rev = cand_vars[cand_i].te_is_rev;
         } else var->vars[i].te_seq_i = -1;
-        var->vars[i].PS = cand_vars[cand_i].phase_set;
+        var->vars[i].PS = large_sv_unphased ? 0 : cand_vars[cand_i].phase_set;
         var->vars[i].ref_bases = get_bseq(ref_seq+var->vars[i].pos-ref_beg, var->vars[i].ref_len);
         if (is_hom) {
             var->vars[i].alt_len = (int*)malloc(1 * sizeof(int));
@@ -1612,6 +1626,26 @@ int make_variants(const call_var_opt_t *opt, bam_chunk_t *chunk, var_t **_var) {
         i++;
     }
     var->n = i;
+    // the sample is hemizygous inside a heterozygous large deletion from a local assembly, so the deleted haplotype
+    // has no reads there and the phasing can put a few stray reads of another copy on it: do not report a small
+    // variant carried by less than the minimum alt read ratio
+    if (deknot_rescue_enabled(opt)) {
+        for (int d = 0; d < var->n; ++d) {
+            var1_t *del = var->vars + d;
+            if (del->type != BAM_CDEL || del->n_alt_allele == 0 || del->GT[0] == del->GT[1] || del->ref_len - 1 < LONGCALLD_LARGE_DEL_COVER_LEN) continue;
+            hts_pos_t del_end = del->pos + del->ref_len - 1;
+            for (int j = 0; j < var->n; ++j) {
+                var1_t *v = var->vars + j;
+                if (j == d || v->n_alt_allele == 0 || v->is_sv || v->GT[0] == v->GT[1]) continue;
+                if (v->pos <= del->pos || v->pos + v->ref_len - 1 >= del_end) continue;
+                if (v->AD[1] >= opt->min_af * v->DP) continue;
+                if (LONGCALLD_VERBOSE >= 1)
+                    fprintf(stderr, "DeKnotHemiSkip %s:%" PRIi64 " AD=%d,%d inside DEL %" PRIi64 "-%" PRIi64 "\n", chunk->tname, v->pos, v->AD[0], v->AD[1], del->pos, del_end);
+                for (int k = 0; k < v->n_alt_allele; ++k) free(v->alt_bases[k]);
+                v->n_alt_allele = 0;
+            }
+        }
+    }
     return(var->m);
 }
 
@@ -2085,6 +2119,21 @@ int get_var_allele_i_from_cons_aln_str(aln_str_t *cons_aln_str, int var_type, in
         assert(alt_len == 1);
         return is_match_aln_str(cons_aln_str, alt_pos, 1, cons_sim_thres, full_cover);
     } else if (var_type == BAM_CINS) {
+        if (alt_len > LONGCALLD_LARGE_INS_COVER_LEN) {
+            // an insertion longer than a read can span (local-assembly SVs): the read carries it when it matches the
+            // consensus across either end of the inserted sequence
+            int f = LONGCALLD_LARGE_INS_COVER_FLANK, cover = 0, alle = -1;
+            for (int end = 0; end < 2; ++end) {
+                int junc = end == 0 ? alt_pos : alt_pos + alt_len, c = 0;
+                if (junc - f < 0) continue;
+                int a = is_match_aln_str(cons_aln_str, junc - f, 2 * f, cons_sim_thres, &c);
+                if (!c) continue;
+                cover = 1;
+                if (a == 1) alle = 1;
+                else if (alle == -1) alle = 0;
+            }
+            if (cover) { *full_cover = 1; return alle; }
+        }
         return is_match_aln_str(cons_aln_str, alt_pos, alt_len, cons_sim_thres, full_cover);
     } else if (var_type == BAM_CDEL) { // XXX large DEL ???
         return is_match_aln_str_del(cons_aln_str, alt_pos-1, alt_pos, cons_sim_thres, full_cover);

@@ -55,6 +55,9 @@
 #define LONGCALLD_DEKNOT_PAIR_MIN_CLIP 500 // reads with a clip this long carry the partner breakpoint (SA tag or placed tail)
 #define LONGCALLD_LARGE_DEL_COVER_LEN 5000 // a read covers a longer deletion of the other haplotype when it spans either breakpoint
 #define LONGCALLD_LARGE_DEL_COVER_FLANK 20 // with this many consensus bases on both sides of the breakpoint
+#define LONGCALLD_LARGE_INS_COVER_LEN 5000 // a read supports a longer insertion when it matches the consensus across either end of the inserted sequence
+#define LONGCALLD_LARGE_INS_COVER_FLANK 50 // with this many consensus bases on both sides of that end
+#define LONGCALLD_LARGE_SV_MIN_ALT_READS 3 // min. junction reads to call a large assembled SV heterozygous when the per-haplotype vote leaves both haplotypes as reference
 #define LONGCALLD_DEKNOT_DEPTH_MIN_MEDIAN_X 2
 #define LONGCALLD_DEKNOT_DEPTH_LOW_FRAC 0.65
 #define LONGCALLD_DEKNOT_DEPTH_MIN_RUN 20000

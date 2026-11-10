@@ -833,8 +833,21 @@ int wfa_collect_aln_str(const call_var_opt_t *opt, uint8_t *target, int tlen, ui
                         NULL, NULL, &aln_str->target_aln, &aln_str->query_aln, &aln_str->aln_len);
         // do not trim for end-gaps
         wfa_trim_aln_str(full_cover, aln_str);
-        aln_str->target_beg += _t_start; aln_str->target_end += _t_start;
-        aln_str->query_beg += _q_start; aln_str->query_end += _q_start;
+        // target_beg/target_end/query_beg/query_end are alignment columns and target positions are counted from
+        // column 0, so the skipped target prefix is put back as gap-only columns (the skipped query prefix needs none)
+        if (_t_start > 0 && aln_str->target_aln != NULL && aln_str->aln_len > 0) {
+            int new_len = aln_str->aln_len + _t_start;
+            uint8_t *_target_aln = (uint8_t*)malloc(new_len * 2 * sizeof(uint8_t));
+            for (int i = 0; i < _t_start; ++i) { _target_aln[i] = target[i]; _target_aln[new_len+i] = 5; }
+            for (int i = 0; i < aln_str->aln_len; ++i) {
+                _target_aln[_t_start+i] = aln_str->target_aln[i];
+                _target_aln[new_len+_t_start+i] = aln_str->query_aln[i];
+            }
+            free(aln_str->target_aln);
+            aln_str->target_aln = _target_aln; aln_str->query_aln = _target_aln + new_len; aln_str->aln_len = new_len;
+            aln_str->target_beg = 0; aln_str->target_end = new_len-1;
+            aln_str->query_beg += _t_start; aln_str->query_end += _t_start;
+        }
     }
     if (LONGCALLD_VERBOSE >= 2) {
         fprintf(stderr, ">target %d:%d-%d\n", tlen, aln_str->target_beg, aln_str->target_end);
@@ -2798,7 +2811,7 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
             // reads fully interior to the window carry no boundary anchor
             if (rlen <= 0 || LONGCALLD_NOISY_IS_NOT_COVER(rcover)) { free(rseq); continue; }
             aln_str_t cand[2];
-            int scores[2] = {INT32_MIN, INT32_MIN};
+            int scores[2] = {INT32_MIN, INT32_MIN}, n_eqs[2] = {0, 0}, n_xids[2] = {0, 0};
             for (int i = 0; i < rescue_n; ++i) {
                 cand[i].target_aln = NULL; cand[i].query_aln = NULL; cand[i].aln_len = 0;
                 cand[i].target_beg = 0; cand[i].target_end = -1; cand[i].query_beg = 0; cand[i].query_end = -1;
@@ -2806,14 +2819,26 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
                                     LONGCALLD_WFA_NO_HEURISTIC, LONGCALLD_WFA_AFFINE_2P, cand + i);
                 if (cand[i].target_aln == NULL || cand[i].aln_len <= 0) continue;
                 int eq = 0, xid = 0;
-                for (int c = cand[i].target_beg; c <= cand[i].target_end && c < cand[i].aln_len; ++c) {
+                // score the columns the read occupies (a partial alignment carries the rest of the consensus as gap columns)
+                int c_beg = cand[i].target_beg > cand[i].query_beg ? cand[i].target_beg : cand[i].query_beg;
+                int c_end = cand[i].target_end < cand[i].query_end ? cand[i].target_end : cand[i].query_end;
+                for (int c = c_beg; c <= c_end && c < cand[i].aln_len; ++c) {
                     if (c < 0) continue;
                     if (cand[i].target_aln[c] == cand[i].query_aln[c] && cand[i].target_aln[c] != 5) eq++;
                     else xid++;
                 }
-                scores[i] = eq - xid;
+                scores[i] = eq - xid; n_eqs[i] = eq; n_xids[i] = xid;
             }
             int best_i = (rescue_n == 2 && scores[1] > scores[0]) ? 1 : 0;
+            // a read that reaches only one window edge is aligned over a different length on each walk (all of it on
+            // the long one, the part that fits on a short deletion walk), so eq - xid would favor the longer alignment
+            // whatever the read's haplotype: compare error rates, and prefer the longer alignment on a tie
+            if (rescue_n == 2 && !LONGCALLD_NOISY_IS_BOTH_COVER(rcover) && scores[0] != INT32_MIN && scores[1] != INT32_MIN) {
+                double r0 = (double)n_xids[0] / (n_eqs[0] + n_xids[0] + 1), r1 = (double)n_xids[1] / (n_eqs[1] + n_xids[1] + 1);
+                if (r1 < r0) best_i = 1;
+                else if (r0 < r1) best_i = 0;
+                else best_i = (n_eqs[1] > n_eqs[0]) ? 1 : 0;
+            }
             if (rescue_n == 2) {
                 int other = 1 - best_i;
                 if (cand[other].target_aln != NULL) free(cand[other].target_aln);
