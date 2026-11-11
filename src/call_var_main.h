@@ -52,6 +52,10 @@
 #define LONGCALLD_DEKNOT_PAIR_MAX_DIST 200000 // the partner breakpoint is searched within this distance of the noisy region
 #define LONGCALLD_DEKNOT_PAIR_MAX_ASM_READS 300 // subsample the paired-window read set beyond this
 #define LONGCALLD_DEKNOT_PAIR_TRIM_FLANK 500
+#define LONGCALLD_DEKNOT_TILE_FLANK 150000 // reads and reference this far beyond a chunk's region are loaded for local assembly only, so a rescue window is not cut at the chunk edge
+#define LONGCALLD_DEKNOT_PAIR_WIN_GRID 5000 // paired-breakpoint windows are widened to this grid, so regions sharing a partner breakpoint get one window (and one assembly)
+#define LONGCALLD_DEKNOT_FRAG_MIN_SHORT 5000 // a walk this much shorter than its window may be a plain fragment of it:
+#define LONGCALLD_DEKNOT_FRAG_MAX_ED 0.01   // when it matches one stretch of the window within this edit fraction, only that stretch is aligned
 #define LONGCALLD_DEKNOT_PAIR_MIN_CLIP 500 // reads with a clip this long carry the partner breakpoint (SA tag or placed tail)
 #define LONGCALLD_LARGE_DEL_COVER_LEN 5000 // a read covers a longer deletion of the other haplotype when it spans either breakpoint
 #define LONGCALLD_LARGE_DEL_COVER_FLANK 20 // with this many consensus bases on both sides of the breakpoint

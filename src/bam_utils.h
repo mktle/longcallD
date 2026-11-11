@@ -70,7 +70,9 @@ typedef struct bam_chunk_t {
     int **up_ovlp_read_i, **down_ovlp_read_i;
     bam1_t **reads;
     int32_t *all_depth; int n_all_depth;
+    hts_pos_t depth_beg; // position of depth bin 0 (the bins cover the region plus the assembly-only flanks)
     bam1_t **lowmq_reads; int n_lowmq_reads, m_lowmq_reads;
+    void *dk_cache; // DeKnot results of the last few assembly windows of this chunk (align.c)
     int32_t *hq_depth;
     // intermidiate
     int *n_clean_agree_snps, *n_clean_conflict_snps; // size: m_reads; XXX include both het and hom clean vars

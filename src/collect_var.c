@@ -2770,8 +2770,10 @@ static void deknot_pair_noisy_regs(bam_chunk_t *chunk, const call_var_opt_t *opt
     }
 }
 
+// het: the SV is on one of two committed haplotypes. the other haplotype is still there inside the SV, so only the
+// regions at the two breakpoints are covered by the assembly; the ones in between keep their ordinary calling
 static void deknot_mark_regions_in_sv(bam_chunk_t *chunk, int noisy_reg_i, hts_pos_t sv_beg, hts_pos_t sv_end,
-                                      hts_pos_t *pair_beg, hts_pos_t *pair_end, int *noisy_reg_is_done) {
+                                      hts_pos_t *pair_beg, hts_pos_t *pair_end, int *noisy_reg_is_done, int het) {
     if (noisy_reg_is_done == NULL || chunk->chunk_noisy_regs == NULL || sv_beg < 0 || sv_end <= sv_beg) return;
     cgranges_t *regs = chunk->chunk_noisy_regs;
     for (int j = 0; j < regs->n_r; ++j) {
@@ -2779,6 +2781,7 @@ static void deknot_mark_regions_in_sv(bam_chunk_t *chunk, int noisy_reg_i, hts_p
         hts_pos_t rb = cr_start(regs, j), re = cr_end(regs, j);
         hts_pos_t ob = rb > sv_beg ? rb : sv_beg, oe = re < sv_end ? re : sv_end;
         int inside = (oe >= ob && (double)(oe - ob + 1) >= LONGCALLD_DEKNOT_PAIR_INSIDE_FRAC * (double)(re - rb + 1));
+        if (inside && het && !((re >= sv_beg - 2000 && rb <= sv_beg + 2000) || (re >= sv_end - 2000 && rb <= sv_end + 2000))) inside = 0;
         int same_pair = (pair_beg != NULL && pair_beg[j] >= 0 && pair_beg[j] >= sv_beg - 2000 && pair_end[j] <= sv_end + 2000
                          && re >= sv_beg - 2000 && rb <= sv_end + 2000);
         if (inside || same_pair) {
@@ -2819,8 +2822,9 @@ static int deknot_depth_runs(bam_chunk_t *chunk, const call_var_opt_t *opt, int 
         }
         i = end + 1;
         if (beg == 0 || end >= n - 1) continue;
-        hts_pos_t rb = chunk->reg_beg + (hts_pos_t)beg * LONGCALLD_DEPTH_BIN, re = chunk->reg_beg + (hts_pos_t)(end + 1) * LONGCALLD_DEPTH_BIN - 1;
-        if (re > chunk->reg_end) re = chunk->reg_end;
+        hts_pos_t rb = chunk->depth_beg + (hts_pos_t)beg * LONGCALLD_DEPTH_BIN, re = chunk->depth_beg + (hts_pos_t)(end + 1) * LONGCALLD_DEPTH_BIN - 1;
+        // the bins reach into the neighbouring chunks: a run belongs to the chunk it starts in, and may end beyond it
+        if (rb < chunk->reg_beg || rb > chunk->reg_end) continue;
         hts_pos_t len = re - rb + 1;
         if (LONGCALLD_VERBOSE >= 2)
             fprintf(stderr, "DeKnotDepthRun %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " median=%d thr=%.1f %s\n", chunk->tname, rb, re, len, median, thr,
@@ -2874,7 +2878,7 @@ static int deknot_depth_rescue1(bam_chunk_t *chunk, const call_var_opt_t *opt, h
         int n_vars = make_vars_from_msa_cons_aln(opt, chunk, n_reads, reads, var_reg_beg, n_cons, clu_n_seqs, clu_read_ids, aln_strs,
                                                  &noisy_vars, &noisy_var_cate, &noisy_rvp);
         merge_var_profile(opt, chunk, n_vars, noisy_vars, noisy_var_cate, noisy_rvp);
-        deknot_mark_regions_in_sv(chunk, -1, sv_beg, sv_end, pair_beg, pair_end, noisy_reg_is_done);
+        deknot_mark_regions_in_sv(chunk, -1, sv_beg, sv_end, pair_beg, pair_end, noisy_reg_is_done, n_cons == 2);
         committed = 1;
     } else if (LONGCALLD_VERBOSE >= 1) {
         fprintf(stderr, "DeKnotDepthFail %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " %d reads\n", chunk->tname, run_beg, run_end, run_end - run_beg + 1, n_reads);
@@ -2957,7 +2961,7 @@ int collect_noisy_vars1(bam_chunk_t *chunk, const call_var_opt_t *opt, int noisy
             aln_strs = p_aln_strs; clu_n_seqs = p_clu_n_seqs; clu_read_ids = p_clu_read_ids;
             noisy_reads = all_reads; n_noisy_reads = n_all;
             n_cons = rescue_n_cons; paired = 1;
-            deknot_mark_regions_in_sv(chunk, noisy_reg_i, sv_beg, sv_end, pair_beg, pair_end, noisy_reg_is_done);
+            deknot_mark_regions_in_sv(chunk, noisy_reg_i, sv_beg, sv_end, pair_beg, pair_end, noisy_reg_is_done, rescue_n_cons == 2);
         } else {
             if (LONGCALLD_VERBOSE >= 1)
                 fprintf(stderr, "DeKnotPairedFail %s:%" PRIi64 "-%" PRIi64 " %" PRIi64 " partner %" PRIi64 "-%" PRIi64 " %d reads\n",

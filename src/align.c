@@ -76,6 +76,7 @@ typedef struct {
     int64_t n_depth_runs, n_depth_asm, n_depth_commit_sv, n_depth_gate_reject;
     int64_t n_pair_junc_reject, n_depth_junc_reject;
     int64_t n_wfa_capped;
+    int64_t n_cache_asm, n_cache_aln; // assemblies and walk alignments reused from the per-chunk window cache
     double outcome_time_sum[DK_OUT_N];  // wall seconds inside dk_assemble_walks, per outcome
     int64_t outcome_reads_sum[DK_OUT_N]; // reads given to the assembler, per outcome
     int64_t reg_len_sum, reg_len_min, reg_len_max; // noisy region length (bp)
@@ -172,6 +173,7 @@ void deknot_print_stats(void) {
             s->n_pair_regions, s->n_pair_asm, s->n_pair_commit_sv, s->n_pair_gate_reject, s->n_pair_junc_reject, s->n_pair_pre_reject,
             s->n_depth_runs, s->n_depth_asm, s->n_depth_commit_sv, s->n_depth_gate_reject, s->n_depth_junc_reject);
     fprintf(stderr, "  paired-pass walks stopped at the WFA score cap: %" PRIi64 "\n", s->n_wfa_capped);
+    fprintf(stderr, "  window cache:             assemblies reused: %" PRIi64 ", walk alignments reused: %" PRIi64 "\n", s->n_cache_asm, s->n_cache_aln);
     if (s->n_asm > 0) {
         double n = (double)s->n_asm;
         fprintf(stderr, "  noisy region length:      min %" PRIi64 ", mean %.0f, max %" PRIi64 " bp\n", s->reg_len_min, s->reg_len_sum / n, s->reg_len_max);
@@ -2150,13 +2152,45 @@ static int deknot_align_walk(const call_var_opt_t *opt, uint8_t *ref_seq, int re
     // DeKnot walks have arbitrary strand: pick the orientation with more matched bases,
     // and reject walks that align poorly either way
     int fwd_eq = 0, fwd_xid = 0, rev_eq = 0, rev_xid = 0;
+    double _t0 = realtime();
     edlib_end2end_aln(ref_seq, ref_seq_len, wseq, wlen, &fwd_eq, &fwd_xid);
+    double _t1 = realtime();
     edlib_end2end_aln(ref_seq, ref_seq_len, wseq_rc, wlen, &rev_eq, &rev_xid);
+    double _t2 = realtime();
     uint8_t *use_seq = (rev_eq > fwd_eq) ? wseq_rc : wseq;
     int best_eq = (rev_eq > fwd_eq) ? rev_eq : fwd_eq;
     int min_len = (wlen < ref_seq_len) ? wlen : ref_seq_len;
     if (best_eq < (int)(0.55 * min_len)) { free(wseq); free(wseq_rc); return 0; }
     if (capped != NULL) *capped = 0;
+    // a walk that is a plain fragment of the window (no SV, just shorter) would get an end-to-end alignment whose
+    // cost is dominated by the two end gaps, which is what makes WFA slow here: locate the fragment first and
+    // align it to that stretch only, with the rest of the window as end gaps
+    int frag_beg = -1, frag_end = -1;
+    if (ref_seq_len - wlen >= LONGCALLD_DEKNOT_FRAG_MIN_SHORT) {
+        EdlibAlignResult r = edlibAlign((const char*)use_seq, wlen, (const char*)ref_seq, ref_seq_len,
+                                        edlibNewAlignConfig((int)(LONGCALLD_DEKNOT_FRAG_MAX_ED * wlen), EDLIB_MODE_HW, EDLIB_TASK_LOC, NULL, 0));
+        if (r.status == EDLIB_STATUS_OK && r.editDistance >= 0 && r.numLocations >= 1 && r.startLocations != NULL) {
+            frag_beg = r.startLocations[0]; frag_end = r.endLocations[0];
+        }
+        edlibFreeAlignResult(r);
+    }
+    if (frag_beg >= 0 && frag_end >= frag_beg) {
+        uint8_t *sub_t = NULL, *sub_q = NULL; int sub_len = 0;
+        wfa_end2end_aln_mem(1, 0, ref_seq + frag_beg, frag_end - frag_beg + 1, use_seq, wlen, opt->gap_aln, opt->mismatch, opt->gap_open1, opt->gap_ext1, opt->gap_open2, opt->gap_ext2,
+                            LONGCALLD_WFA_NO_HEURISTIC, LONGCALLD_WFA_AFFINE_2P,
+                            NULL, NULL, &sub_t, &sub_q, &sub_len);
+        if (sub_len > 0) {
+            int tail = ref_seq_len - 1 - frag_end, new_len = frag_beg + sub_len + tail;
+            uint8_t *mem = (uint8_t*)malloc((size_t)new_len * 2);
+            uint8_t *t = mem, *q = mem + new_len;
+            memcpy(t, ref_seq, frag_beg); memset(q, 5, frag_beg);
+            memcpy(t + frag_beg, sub_t, sub_len); memcpy(q + frag_beg, sub_q, sub_len);
+            memcpy(t + frag_beg + sub_len, ref_seq + frag_end + 1, tail); memset(q + frag_beg + sub_len, 5, tail);
+            as->target_aln = mem; as->query_aln = q; as->aln_len = new_len;
+        }
+        if (sub_t != NULL) free(sub_t);
+    }
+    if (as->aln_len <= 0) {
     if (cap_div > 0) {
         long long d = wlen > ref_seq_len ? wlen - ref_seq_len : ref_seq_len - wlen;
         long long g1 = opt->gap_open1 + (long long)opt->gap_ext1 * d, g2 = opt->gap_open2 + (long long)opt->gap_ext2 * d;
@@ -2168,6 +2202,8 @@ static int deknot_align_walk(const call_var_opt_t *opt, uint8_t *ref_seq, int re
                         NULL, NULL, &as->target_aln, &as->query_aln, &as->aln_len);
     wfa_max_steps = INT_MAX;
     if (capped != NULL) *capped = wfa_last_capped;
+    }
+    if (getenv("DK_ALN_TIME")) fprintf(stderr, "DeKnotAlnTime wlen=%d ref=%d edlib_fwd=%.2fs (eq=%d) edlib_rc=%.2fs (eq=%d) wfa=%.2fs frag=%d\n", wlen, ref_seq_len, _t1-_t0, fwd_eq, _t2-_t1, rev_eq, realtime()-_t2, frag_beg >= 0);
     free(wseq); free(wseq_rc);
     if (as->aln_len <= 0) {
         if (as->target_aln != NULL) free(as->target_aln);
@@ -2269,15 +2305,15 @@ hts_pos_t deknot_find_unique_flank(bam_chunk_t *chunk, hts_pos_t from, int dir, 
     if (chunk->hq_depth == NULL || median <= 0) return -1;
     double thr = LONGCALLD_DEKNOT_UNIQUE_FRAC * median;
     int need = LONGCALLD_DEKNOT_UNIQUE_LEN / LONGCALLD_DEPTH_BIN;
-    int b = (int)((from - chunk->reg_beg) / LONGCALLD_DEPTH_BIN);
-    int lb = (int)((limit - chunk->reg_beg) / LONGCALLD_DEPTH_BIN);
+    int b = (int)((from - chunk->depth_beg) / LONGCALLD_DEPTH_BIN);
+    int lb = (int)((limit - chunk->depth_beg) / LONGCALLD_DEPTH_BIN);
     int run = 0, run_inner = -1;
     for (; dir < 0 ? b >= lb : b <= lb; b += dir) {
         if (b < 0 || b >= chunk->n_all_depth) break;
         if (chunk->hq_depth[b] >= thr) {
             if (run == 0) run_inner = b;
             if (++run >= need) {
-                hts_pos_t edge = chunk->reg_beg + (hts_pos_t)run_inner * LONGCALLD_DEPTH_BIN;
+                hts_pos_t edge = chunk->depth_beg + (hts_pos_t)run_inner * LONGCALLD_DEPTH_BIN;
                 hts_pos_t inner = dir < 0 ? edge + LONGCALLD_DEPTH_BIN - 1 : edge;
                 hts_pos_t seg_beg = dir < 0 ? inner - LONGCALLD_DEKNOT_UNIQUE_SEG + 1 : inner;
                 if (deknot_ref_seg_unique(chunk, seg_beg)) return inner;
@@ -2412,6 +2448,92 @@ static int deknot_lowmq_window_seq(bam1_t *b, hts_pos_t beg, hts_pos_t end, char
     return n;
 }
 
+// Per-chunk cache of DeKnot results. Neighbouring noisy regions, the two regions of a breakpoint pair and
+// overlapping depth runs often expand to the same window with the same reads; the assembly and the
+// walk-vs-reference alignments (the two expensive steps) are then reused. A hit needs the same window and the
+// same read ids, so the reused result is the one a fresh run would produce.
+#define DK_CACHE_N 8
+#define DK_CACHE_MAX_ALN 16
+typedef struct {
+    int walk_i; double cap_div; int ok, rb, re, sc; aln_str_t as;
+} dk_cache_aln_t;
+typedef struct {
+    int used; hts_pos_t beg, end; uint64_t reads_hash; int n_reads;
+    dk_walks_t *walks;
+    int n_aln; dk_cache_aln_t aln[DK_CACHE_MAX_ALN];
+} dk_cache_entry_t;
+typedef struct { dk_cache_entry_t e[DK_CACHE_N]; int next; } dk_cache_t;
+
+static void dk_cache_entry_clear(dk_cache_entry_t *e) {
+    if (!e->used) return;
+    if (e->walks != NULL) dk_walks_free(e->walks);
+    for (int i = 0; i < e->n_aln; ++i) if (e->aln[i].as.target_aln != NULL) free(e->aln[i].as.target_aln);
+    memset(e, 0, sizeof(dk_cache_entry_t));
+}
+
+void deknot_cache_free(void *cache) {
+    dk_cache_t *c = (dk_cache_t*)cache;
+    if (c == NULL) return;
+    for (int i = 0; i < DK_CACHE_N; ++i) dk_cache_entry_clear(c->e + i);
+    free(c);
+}
+
+static uint64_t dk_cache_hash_ids(const int *ids, int n) {
+    uint64_t h = 1469598103934665603ULL;
+    for (int i = 0; i < n; ++i) { h ^= (uint64_t)(uint32_t)ids[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+static dk_cache_entry_t *dk_cache_find(bam_chunk_t *chunk, hts_pos_t beg, hts_pos_t end, uint64_t reads_hash, int n_reads) {
+    dk_cache_t *c = (dk_cache_t*)chunk->dk_cache;
+    if (c == NULL || getenv("DK_NO_CACHE") != NULL) return NULL;
+    for (int i = 0; i < DK_CACHE_N; ++i) {
+        dk_cache_entry_t *e = c->e + i;
+        if (e->used && e->beg == beg && e->end == end && e->reads_hash == reads_hash && e->n_reads == n_reads) return e;
+    }
+    return NULL;
+}
+
+// the cache takes ownership of walks (NULL is a valid result)
+static dk_cache_entry_t *dk_cache_add(bam_chunk_t *chunk, hts_pos_t beg, hts_pos_t end, uint64_t reads_hash, int n_reads, dk_walks_t *walks) {
+    if (chunk->dk_cache == NULL) chunk->dk_cache = calloc(1, sizeof(dk_cache_t));
+    dk_cache_t *c = (dk_cache_t*)chunk->dk_cache;
+    dk_cache_entry_t *e = c->e + c->next;
+    c->next = (c->next + 1) % DK_CACHE_N;
+    dk_cache_entry_clear(e);
+    e->used = 1; e->beg = beg; e->end = end; e->reads_hash = reads_hash; e->n_reads = n_reads; e->walks = walks;
+    return e;
+}
+
+static void dk_cache_copy_aln(const aln_str_t *src, aln_str_t *dst) {
+    *dst = *src;
+    if (src->target_aln == NULL || src->aln_len <= 0) { dst->target_aln = NULL; dst->query_aln = NULL; dst->aln_len = 0; return; }
+    // the two rows share one allocation that starts at target_aln, but the query row is not always right behind it
+    dst->target_aln = (uint8_t*)malloc((size_t)src->aln_len * 2);
+    dst->query_aln = dst->target_aln + src->aln_len;
+    memcpy(dst->target_aln, src->target_aln, (size_t)src->aln_len);
+    memcpy(dst->query_aln, src->query_aln, (size_t)src->aln_len);
+}
+
+static int dk_cache_get_aln(dk_cache_entry_t *e, int walk_i, double cap_div, aln_str_t *as, int *rb, int *re, int *sc, int *ok) {
+    for (int i = 0; i < e->n_aln; ++i) {
+        dk_cache_aln_t *a = e->aln + i;
+        if (a->walk_i != walk_i || a->cap_div != cap_div) continue;
+        dk_cache_copy_aln(&a->as, as);
+        *rb = a->rb; *re = a->re; *sc = a->sc; *ok = a->ok;
+        return 1;
+    }
+    return 0;
+}
+
+static void dk_cache_put_aln(dk_cache_entry_t *e, int walk_i, double cap_div, const aln_str_t *as, int rb, int re, int sc, int ok) {
+    if (e->n_aln >= DK_CACHE_MAX_ALN) return;
+    dk_cache_aln_t *a = e->aln + e->n_aln++;
+    a->walk_i = walk_i; a->cap_div = cap_div; a->rb = rb; a->re = re; a->sc = sc; a->ok = ok;
+    if (ok) dk_cache_copy_aln(as, &a->as);
+    else { a->as.target_aln = NULL; a->as.query_aln = NULL; a->as.aln_len = 0; }
+}
+
 static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, hts_pos_t noisy_reg_beg, hts_pos_t noisy_reg_end,
                      hts_pos_t pair_beg, hts_pos_t pair_end,
                      int n_noisy_reads, int *noisy_reads, hts_pos_t flank_len, int abort_on_edge, int *hit_window_edge, int pass,
@@ -2442,6 +2564,13 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
     *hit_window_edge = 0;
     hts_pos_t exp_beg = (win_lo >= 0 && win_lo < reg_beg ? win_lo : reg_beg) - flank_len;
     hts_pos_t exp_end = (win_hi > reg_end ? win_hi : reg_end) + flank_len;
+    // neighbouring noisy regions with the same partner breakpoint differ by a few hundred bases: on a common grid
+    // they share one window, hence one assembly and one set of walk alignments (see the window cache)
+    if (pass == DK_PASS_PAIRED) {
+        exp_beg -= exp_beg % LONGCALLD_DEKNOT_PAIR_WIN_GRID;
+        exp_end += (LONGCALLD_DEKNOT_PAIR_WIN_GRID - exp_end % LONGCALLD_DEKNOT_PAIR_WIN_GRID) % LONGCALLD_DEKNOT_PAIR_WIN_GRID;
+        max_win += 2 * LONGCALLD_DEKNOT_PAIR_WIN_GRID;
+    }
     if (exp_beg < 1) exp_beg = 1;
     uint8_t *ref_seq = NULL;
     int ref_seq_len = collect_reg_ref_bseq(chunk, &exp_beg, &exp_end, &ref_seq);
@@ -2490,6 +2619,7 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         free(read_ids);
         read_ids = kept; n_reads = n_kept;
     }
+    uint64_t cache_hash = dk_cache_hash_ids(read_ids, n_reads); int cache_n = n_reads;
 
     int n_lowmq = 0;
     for (int i = 0; i < chunk->n_lowmq_reads; ++i) {
@@ -2526,9 +2656,20 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
     }
     dk_opt_t dk_opt; dk_opt_init(&dk_opt);
     dk_opt.check_strand = (opt->is_ont != 0);
-    double asm_t0 = realtime();
-    dk_walks_t *walks = dk_assemble_walks(&dk_opt, read_strs, read_names, n_reads);
-    double asm_secs = realtime() - asm_t0;
+    // the window's walks belong to the cache from here on (it frees them)
+    dk_cache_entry_t *cache_e = dk_cache_find(chunk, exp_beg, exp_end, cache_hash, cache_n);
+    dk_walks_t *walks; double asm_secs = 0.0;
+    if (cache_e != NULL) {
+        walks = cache_e->walks;
+        dk_stats_count(&dk_stats.n_cache_asm);
+        if (LONGCALLD_VERBOSE >= 1)
+            fprintf(stderr, "DeKnotCache %s:%" PRIi64 "-%" PRIi64 " window %" PRIi64 "-%" PRIi64 " reused\n", chunk->tname, noisy_reg_beg, noisy_reg_end, exp_beg, exp_end);
+    } else {
+        double asm_t0 = realtime();
+        walks = dk_assemble_walks(&dk_opt, read_strs, read_names, n_reads);
+        asm_secs = realtime() - asm_t0;
+        cache_e = dk_cache_add(chunk, exp_beg, exp_end, cache_hash, cache_n, walks);
+    }
     int n_walks = (walks == NULL) ? 0 : walks->n_walks;
     int walks_null = (walks == NULL), demoted = 0;
     int sel = DK_SEL_NONE, collapsed = 0;
@@ -2540,7 +2681,6 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
     if (n_walks == 0 || (n_walks <= 2 && rescue_n <= n_cons_existing)) {
         outcome = (n_walks == 0) ? DK_OUT_NO_WALKS : DK_OUT_NO_GAIN;
         dk_stats_add_attempt(chunk, noisy_reg_beg, noisy_reg_end, exp_beg, exp_end, n_reads, n_noisy_reads, subsampled, n_walks, walks_null, demoted, sel, collapsed, asm_secs, pass, outcome);
-        if (walks != NULL) dk_walks_free(walks);
         for (int i = 0; i < n_reads; ++i) { free(read_strs[i]); free(read_names[i]); }
         free(read_strs); free(read_names); free(read_ids); free(ref_seq);
         return -1;
@@ -2588,9 +2728,15 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
     for (int k = 0; k < n_aln; ++k) {
         int rb = -1, re = -1, sc = 0;
         int capped = 0;
-        int ok = deknot_align_walk(opt, ref_seq, ref_seq_len, walks->walks[aln_order[k]], cand_alns + n_cand, &rb, &re, &sc,
-                                   paired ? LONGCALLD_DEKNOT_PAIR_WFA_CAP_DIV : 0.0, &capped);
-        if (capped) dk_stats_count(&dk_stats.n_wfa_capped);
+        double cap_div = paired ? LONGCALLD_DEKNOT_PAIR_WFA_CAP_DIV : 0.0;
+        int ok = 0;
+        if (dk_cache_get_aln(cache_e, aln_order[k], cap_div, cand_alns + n_cand, &rb, &re, &sc, &ok)) {
+            dk_stats_count(&dk_stats.n_cache_aln);
+        } else {
+            ok = deknot_align_walk(opt, ref_seq, ref_seq_len, walks->walks[aln_order[k]], cand_alns + n_cand, &rb, &re, &sc, cap_div, &capped);
+            if (capped) dk_stats_count(&dk_stats.n_wfa_capped);
+            dk_cache_put_aln(cache_e, aln_order[k], cap_div, cand_alns + n_cand, rb, re, sc, ok);
+        }
         if (LONGCALLD_VERBOSE >= 2 || (paired && LONGCALLD_VERBOSE >= 1))
             fprintf(stderr, "DeKnotWalk %s:%" PRIi64 "-%" PRIi64 " walk=%d len=%d aligned=%d%s ref=%" PRIi64 "-%" PRIi64 " score=%d span=%d\n",
                     chunk->tname, noisy_reg_beg, noisy_reg_end, aln_order[k], wlens[aln_order[k]], ok, capped ? " (WFA score cap reached)" : "",
@@ -2666,7 +2812,6 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         outcome = (rescue_n == 0) ? DK_OUT_MANY_WALKS : DK_OUT_NO_GAIN;
         for (int i = 0; i < rescue_n; ++i) free(walk_alns[i].target_aln);
         dk_stats_add_attempt(chunk, noisy_reg_beg, noisy_reg_end, exp_beg, exp_end, n_reads, n_noisy_reads, subsampled, n_walks, walks_null, demoted, sel, collapsed, asm_secs, pass, outcome);
-        dk_walks_free(walks);
         for (int i = 0; i < n_reads; ++i) { free(read_strs[i]); free(read_names[i]); }
         free(read_strs); free(read_names); free(read_ids); free(ref_seq);
         return -1;
@@ -2715,7 +2860,6 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         if (!found || !junc_ok) {
             for (int i = 0; i < rescue_n; ++i) free(walk_alns[i].target_aln);
             dk_stats_add_attempt(chunk, noisy_reg_beg, noisy_reg_end, exp_beg, exp_end, n_reads, n_noisy_reads, subsampled, n_walks, walks_null, demoted, sel, collapsed, asm_secs, pass, !junc_ok ? DK_OUT_PAIR_NO_JUNC : rescue_n == 0 ? DK_OUT_POOR_ALN : DK_OUT_PAIR_NO_SV);
-            dk_walks_free(walks);
             for (int i = 0; i < n_reads; ++i) { free(read_strs[i]); free(read_names[i]); }
             free(read_strs); free(read_names); free(read_ids); free(ref_seq);
             return -1;
@@ -2744,7 +2888,6 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
             for (int i = 0; i < rescue_n; ++i) {
                 if (walk_alns[i].target_aln != NULL) free(walk_alns[i].target_aln);
             }
-            dk_walks_free(walks);
             for (int i = 0; i < n_reads; ++i) { free(read_strs[i]); free(read_names[i]); }
             free(read_strs); free(read_names); free(read_ids); free(ref_seq);
             return -1;
@@ -2899,7 +3042,6 @@ static int deknot_sv_rescue_core(const call_var_opt_t *opt, bam_chunk_t *chunk, 
         outcome = DK_OUT_POOR_ALN;
     }
     dk_stats_add_attempt(chunk, noisy_reg_beg, noisy_reg_end, exp_beg, exp_end, n_reads, n_noisy_reads, subsampled, n_walks, walks_null, demoted, sel, collapsed, asm_secs, pass, outcome);
-    dk_walks_free(walks);
     for (int i = 0; i < n_reads; ++i) { free(read_strs[i]); free(read_names[i]); }
     free(read_strs); free(read_names); free(read_ids); free(ref_seq);
     return rescue_n;

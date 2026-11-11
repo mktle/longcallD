@@ -10,6 +10,8 @@
 extern int LONGCALLD_VERBOSE;
 
 
+extern void deknot_cache_free(void *cache); // align.c
+
 static read_var_profile_t *init_read_var_profile_inner(int n_reads, int *read_ids, int n_total_vars) {
     size_t n_profile_bytes = (size_t)n_reads * sizeof(read_var_profile_t);
     size_t n_var_values = (size_t)n_reads * (size_t)n_total_vars;
@@ -1343,8 +1345,9 @@ int bam_chunk_init0(bam_chunk_t *chunk, const struct call_var_opt_t *opt, int n_
         chunk->down_ovlp_read_i[i] = (int*)malloc(n_reads * sizeof(int));
     }
     chunk->reads = (bam1_t**)malloc(n_reads * sizeof(bam1_t*));
-    chunk->all_depth = NULL; chunk->n_all_depth = 0; chunk->hq_depth = NULL;
+    chunk->all_depth = NULL; chunk->n_all_depth = 0; chunk->hq_depth = NULL; chunk->depth_beg = 0;
     chunk->lowmq_reads = NULL; chunk->n_lowmq_reads = 0; chunk->m_lowmq_reads = 0;
+    chunk->dk_cache = NULL;
     chunk->ref_seq = NULL;
     chunk->low_comp_cr = NULL;
     // intermediate
@@ -1449,6 +1452,7 @@ void bam_chunk_free(bam_chunk_t *chunk) {
         for (int i = 0; i < chunk->n_lowmq_reads; ++i) bam_destroy1(chunk->lowmq_reads[i]);
         free(chunk->lowmq_reads); chunk->lowmq_reads = NULL; chunk->n_lowmq_reads = chunk->m_lowmq_reads = 0;
     }
+    if (chunk->dk_cache != NULL) { deknot_cache_free(chunk->dk_cache); chunk->dk_cache = NULL; }
     if (chunk->ref_seq != NULL) free(chunk->ref_seq);
     if (chunk->low_comp_cr != NULL) cr_destroy(chunk->low_comp_cr);
     bam_chunk_clear_var_noisy_read_cache(chunk);
@@ -1508,6 +1512,7 @@ void bam_chunk_post_free(bam_chunk_t *chunk, const struct call_var_opt_t *opt) {
         for (int i = 0; i < chunk->n_lowmq_reads; ++i) bam_destroy1(chunk->lowmq_reads[i]);
         free(chunk->lowmq_reads); chunk->lowmq_reads = NULL; chunk->n_lowmq_reads = chunk->m_lowmq_reads = 0;
     }
+    if (chunk->dk_cache != NULL) { deknot_cache_free(chunk->dk_cache); chunk->dk_cache = NULL; }
     if (chunk->ref_seq != NULL) free(chunk->ref_seq);
     if (chunk->cand_vars != NULL) free_cand_vars(chunk->cand_vars, chunk->n_cand_vars);
     if (chunk->var_i_to_cate != NULL) free(chunk->var_i_to_cate);
@@ -1672,10 +1677,11 @@ void sort_chunk_reads(bam_chunk_t *chunk) {
 static void bam_chunk_add_all_depth(bam_chunk_t *chunk, bam1_t *b) {
     if (chunk->all_depth == NULL) return;
     hts_pos_t beg = b->core.pos + 1, end = bam_endpos(b);
-    if (end < chunk->reg_beg || beg > chunk->reg_end) return;
-    if (beg < chunk->reg_beg) beg = chunk->reg_beg;
-    if (end > chunk->reg_end) end = chunk->reg_end;
-    int b0 = (int)((beg - chunk->reg_beg) / LONGCALLD_DEPTH_BIN), b1 = (int)((end - chunk->reg_beg) / LONGCALLD_DEPTH_BIN);
+    hts_pos_t depth_end = chunk->depth_beg + (hts_pos_t)chunk->n_all_depth * LONGCALLD_DEPTH_BIN - 1;
+    if (end < chunk->depth_beg || beg > depth_end) return;
+    if (beg < chunk->depth_beg) beg = chunk->depth_beg;
+    if (end > depth_end) end = depth_end;
+    int b0 = (int)((beg - chunk->depth_beg) / LONGCALLD_DEPTH_BIN), b1 = (int)((end - chunk->depth_beg) / LONGCALLD_DEPTH_BIN);
     int hq = (chunk->hq_depth != NULL && b->core.qual >= LONGCALLD_DEKNOT_UNIQUE_MQ);
     for (int i = b0; i <= b1 && i < chunk->n_all_depth; ++i) { chunk->all_depth[i]++; if (hq) chunk->hq_depth[i]++; }
 }
@@ -1693,7 +1699,11 @@ int collect_ref_seq_bam_main(const struct call_var_pl_t *pl, struct call_var_io_
     chunk->reg_chunk_i = reg_chunk_i; chunk->reg_i = reg_i;
     chunk->tid = tid; chunk->tname = io_aux->headers[0]->target_name[tid]; chunk->reg_beg = reg_beg; chunk->reg_end = reg_end;
     if (opt->use_deknot) {
-        chunk->n_all_depth = (int)((reg_end - reg_beg) / LONGCALLD_DEPTH_BIN) + 1;
+        // depth bins also cover the assembly-only flanks, so a low-depth run can be followed across the region edge
+        hts_pos_t n_left = LONGCALLD_DEKNOT_TILE_FLANK / LONGCALLD_DEPTH_BIN;
+        if (reg_beg - n_left * LONGCALLD_DEPTH_BIN < 1) n_left = (reg_beg - 1) / LONGCALLD_DEPTH_BIN;
+        chunk->depth_beg = reg_beg - n_left * LONGCALLD_DEPTH_BIN;
+        chunk->n_all_depth = (int)((reg_end + LONGCALLD_DEKNOT_TILE_FLANK - chunk->depth_beg) / LONGCALLD_DEPTH_BIN) + 1;
         chunk->all_depth = (int32_t*)calloc(chunk->n_all_depth, sizeof(int32_t));
         chunk->hq_depth = (int32_t*)calloc(chunk->n_all_depth, sizeof(int32_t));
     }
@@ -1746,6 +1756,39 @@ int collect_ref_seq_bam_main(const struct call_var_pl_t *pl, struct call_var_io_
         bam_itr_destroy(iter);
     }
     if (chunk->n_reads <= 0) return 0;
+    if (opt->use_deknot) {
+        // a chunk only holds the reads over its own region, so a local-assembly window near the chunk edge would be
+        // cut there and miss the reads of the neighbouring chunk (a large SV across the edge is then never
+        // assembled): keep the primary reads within LONGCALLD_DEKNOT_TILE_FLANK of the region as assembly-only
+        // input, next to the low-MAPQ reads, and load the reference that far too
+        bam1_t *r = bam_init1();
+        for (int i = 0; i < io_aux->n_bam; ++i) {
+            for (int side = 0; side < 2; ++side) {
+                hts_pos_t a = side == 0 ? reg_beg - LONGCALLD_DEKNOT_TILE_FLANK : reg_end + 1;
+                hts_pos_t b = side == 0 ? reg_beg - 1 : reg_end + LONGCALLD_DEKNOT_TILE_FLANK;
+                if (a < 1) a = 1;
+                if (b < a) continue;
+                hts_itr_t *iter = sam_itr_queryi(io_aux->idxs[i], tid, a-1, b);
+                if (iter == NULL) continue;
+                while (sam_itr_next(io_aux->bams[i], iter, r) >= 0) {
+                    if (r->core.flag & (BAM_FUNMAP | BAM_FSECONDARY | BAM_FSUPPLEMENTARY)) continue;
+                    if (r->core.pos + 1 <= reg_end && bam_endpos(r) >= reg_beg) continue; // loaded with the region
+                    if (chunk->n_lowmq_reads == chunk->m_lowmq_reads) {
+                        chunk->m_lowmq_reads = chunk->m_lowmq_reads ? 2 * chunk->m_lowmq_reads : 64;
+                        chunk->lowmq_reads = (bam1_t**)realloc(chunk->lowmq_reads, chunk->m_lowmq_reads * sizeof(bam1_t*));
+                    }
+                    bam_chunk_add_all_depth(chunk, r);
+                    bam1_t *d = bam_dup1(r);
+                    d->l_data = (int)(bam_get_aux(d) - d->data); // only the alignment and sequence are used
+                    chunk->lowmq_reads[chunk->n_lowmq_reads++] = d;
+                }
+                bam_itr_destroy(iter);
+            }
+        }
+        bam_destroy1(r);
+        min_read_beg = min_read_beg > LONGCALLD_DEKNOT_TILE_FLANK ? min_read_beg - LONGCALLD_DEKNOT_TILE_FLANK : 1;
+        max_read_end += LONGCALLD_DEKNOT_TILE_FLANK;
+    }
     // load ref seq
     get_bam_chunk_reg_ref_seq0(io_aux->fai, chunk, min_read_beg, max_read_end);
     if (LONGCALLD_VERBOSE >= 2) {
